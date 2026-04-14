@@ -1,46 +1,30 @@
 [
   {
-    "content": "Phase 1: Backend - Add po_accessories to GET /api/production-pos/{po_id} response",
+    "content": "Phase 3: RBAC bug fix - Custom role permissions not working for PO/shipment creation",
     "status": "completed"
   },
   {
-    "content": "Phase 1: Backend - Add po_accessories to GET /api/vendor-shipments/{sid} response",
+    "content": "Phase 4: Accessories in material inspection + additional shipment requests with accessories",
     "status": "completed"
   },
   {
-    "content": "Phase 1: Backend - Store po_id at vendor shipment level for linking",
+    "content": "Phase 5: Vendor inspection PDF export (materials + accessories + PO info)",
     "status": "completed"
   },
   {
-    "content": "Phase 1: POC test script to verify accessories flow via API",
+    "content": "Phase 6: Product photos - upload in master data + display in downstream views",
     "status": "completed"
   },
   {
-    "content": "Phase 2: Frontend - Show accessories in PO Detail modal (ProductionPOModule)",
+    "content": "Phase 7: Dashboard UI/UX - modern analytics visualizations + date range filter",
     "status": "completed"
   },
   {
-    "content": "Phase 2: Frontend - Show PO accessories when selecting PO in shipment creation (VendorShipmentModule)",
+    "content": "Phase 8: Serial Tracking - expandable serial list in ERP + vendor portal",
     "status": "completed"
   },
   {
-    "content": "Phase 2: Frontend - Show PO accessories in shipment detail (VendorShipmentModule)",
-    "status": "completed"
-  },
-  {
-    "content": "Phase 2: Frontend - Show PO accessories in Vendor Portal (VendorPortalApp)",
-    "status": "completed"
-  },
-  {
-    "content": "Phase 2: End-to-end testing using Testing Agent",
-    "status": "completed"
-  },
-  {
-    "content": "Phase 3: Dashboard UI/UX improvements",
-    "status": "pending"
-  },
-  {
-    "content": "Phase 3: Serial Tracking UI/UX improvements",
-    "status": "pending"
+    "content": "Phase 9: Regression testing for all new features",
+    "status": "in_progress"
   }
 ]

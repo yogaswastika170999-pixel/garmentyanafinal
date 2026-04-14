@@ -1601,14 +1601,13 @@ function VendorMaterialInspection({ token, user }) {
   const [selectedShipment, setSelectedShipment] = useState(null);
   const [detailData, setDetailData] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [form, setForm] = useState({ inspection_date: new Date().toISOString().split('T')[0], overall_notes: '', items: [] });
+  const [form, setForm] = useState({ inspection_date: new Date().toISOString().split('T')[0], overall_notes: '', items: [], accessory_items: [] });
 
   useEffect(() => { fetchShipments(); fetchInspections(); }, []);
 
   const fetchShipments = async () => {
     const res = await fetch('/api/vendor-shipments', { headers: { Authorization: `Bearer ${token}` } });
     const data = await res.json();
-    // Only received shipments that haven't been inspected
     const received = Array.isArray(data) ? data.filter(s => s.status === 'Received') : [];
     setShipments(received);
   };
@@ -1621,7 +1620,6 @@ function VendorMaterialInspection({ token, user }) {
 
   const openInspect = async (shipment) => {
     setSelectedShipment(shipment);
-    // Load shipment items
     const res = await fetch(`/api/vendor-shipments/${shipment.id}`, { headers: { Authorization: `Bearer ${token}` } });
     const data = await res.json();
     const items = (data.items || []).map(si => ({
@@ -1631,22 +1629,41 @@ function VendorMaterialInspection({ token, user }) {
       size: si.size || '',
       color: si.color || '',
       ordered_qty: si.qty_sent || 0,
-      received_qty: si.qty_sent || 0, // default to all received
+      received_qty: si.qty_sent || 0,
       missing_qty: 0,
       condition_notes: ''
     }));
-    setForm({ inspection_date: new Date().toISOString().split('T')[0], overall_notes: '', items });
+    // Load PO accessories for inspection
+    const accessory_items = (data.po_accessories || []).map(acc => ({
+      accessory_id: acc.accessory_id || acc.id || '',
+      accessory_name: acc.accessory_name || '',
+      accessory_code: acc.accessory_code || '',
+      unit: acc.unit || 'pcs',
+      ordered_qty: acc.qty_needed || 0,
+      received_qty: acc.qty_needed || 0,
+      missing_qty: 0,
+      condition_notes: ''
+    }));
+    setForm({ inspection_date: new Date().toISOString().split('T')[0], overall_notes: '', items, accessory_items });
     setShowModal(true);
   };
 
   const updateItem = (idx, field, value) => {
     const newItems = [...form.items];
     newItems[idx] = { ...newItems[idx], [field]: value };
-    // Auto-calc missing_qty = ordered_qty - received_qty
     if (field === 'received_qty') {
       newItems[idx].missing_qty = Math.max(0, (newItems[idx].ordered_qty || 0) - (Number(value) || 0));
     }
     setForm(f => ({ ...f, items: newItems }));
+  };
+
+  const updateAccItem = (idx, field, value) => {
+    const newItems = [...form.accessory_items];
+    newItems[idx] = { ...newItems[idx], [field]: value };
+    if (field === 'received_qty') {
+      newItems[idx].missing_qty = Math.max(0, (newItems[idx].ordered_qty || 0) - (Number(value) || 0));
+    }
+    setForm(f => ({ ...f, accessory_items: newItems }));
   };
 
   const handleSubmit = async (e) => {
@@ -1842,6 +1859,52 @@ function VendorMaterialInspection({ token, user }) {
               <textarea rows="2" className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" value={form.overall_notes} onChange={e => setForm(f => ({ ...f, overall_notes: e.target.value }))} placeholder="Catatan kondisi material secara umum..." />
             </div>
 
+            {/* Accessories Inspection */}
+            {form.accessory_items.length > 0 && (
+              <div className="mt-3" data-testid="inspection-accessories">
+                <label className="block text-sm font-semibold text-emerald-700 mb-2">Inspeksi Aksesoris ({form.accessory_items.length} item)</label>
+                <div className="overflow-x-auto border border-emerald-200 rounded-xl">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="bg-emerald-50">
+                        <th className="text-left px-3 py-2 text-xs text-emerald-700">Aksesoris</th>
+                        <th className="text-left px-3 py-2 text-xs text-emerald-700">Kode</th>
+                        <th className="text-right px-3 py-2 text-xs text-slate-600">Qty Dibutuhkan</th>
+                        <th className="text-right px-3 py-2 text-xs text-emerald-700">Diterima *</th>
+                        <th className="text-right px-3 py-2 text-xs text-red-600">Missing</th>
+                        <th className="text-left px-3 py-2 text-xs">Catatan</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {form.accessory_items.map((acc, idx) => (
+                        <tr key={idx} className="border-t border-emerald-100">
+                          <td className="px-3 py-2 font-medium text-xs text-slate-700">{acc.accessory_name}</td>
+                          <td className="px-3 py-2 font-mono text-xs text-emerald-600">{acc.accessory_code}</td>
+                          <td className="px-3 py-2 text-right text-slate-600 font-medium">{acc.ordered_qty} {acc.unit}</td>
+                          <td className="px-3 py-2 text-right">
+                            <input type="number" min="0" className="w-20 border border-emerald-200 rounded px-2 py-1 text-sm text-right focus:outline-none focus:ring-1 focus:ring-emerald-500" value={acc.received_qty} onChange={e => updateAccItem(idx, 'received_qty', e.target.value)} />
+                          </td>
+                          <td className={`px-3 py-2 text-right font-semibold ${acc.missing_qty > 0 ? 'text-red-600' : 'text-slate-400'}`}>{acc.missing_qty}</td>
+                          <td className="px-3 py-2">
+                            <input className="w-full border border-slate-200 rounded px-2 py-1 text-xs" value={acc.condition_notes} onChange={e => updateAccItem(idx, 'condition_notes', e.target.value)} placeholder="Kondisi aksesoris..." />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot className="bg-emerald-50 font-bold border-t-2 border-emerald-200">
+                      <tr>
+                        <td className="px-3 py-2 text-sm" colSpan="2">Total Aksesoris</td>
+                        <td className="px-3 py-2 text-right">{form.accessory_items.reduce((s, i) => s + (i.ordered_qty || 0), 0)}</td>
+                        <td className="px-3 py-2 text-right text-emerald-700">{form.accessory_items.reduce((s, i) => s + (Number(i.received_qty) || 0), 0)}</td>
+                        <td className="px-3 py-2 text-right text-red-600">{form.accessory_items.reduce((s, i) => s + (i.missing_qty || 0), 0)}</td>
+                        <td></td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              </div>
+            )}
+
             <div className="flex gap-3">
               <button type="submit" disabled={loading} className="flex-1 bg-emerald-600 text-white py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 disabled:opacity-50">
                 {loading ? 'Menyimpan...' : 'Kirim Laporan Inspeksi'}
@@ -1856,19 +1919,25 @@ function VendorMaterialInspection({ token, user }) {
       {showDetail && detailData && (
         <Modal title={`Detail Inspeksi: ${detailData.shipment_number}`} onClose={() => setShowDetail(false)} size="xl">
           <div className="space-y-4">
-            <div className="grid grid-cols-3 gap-3">
-              <div className="bg-emerald-50 rounded-lg p-3 text-center">
-                <p className="text-xs text-emerald-600">Total Diterima</p>
-                <p className="text-2xl font-bold text-emerald-700">{detailData.total_received}</p>
+            <div className="flex items-center justify-between">
+              <div className="grid grid-cols-3 gap-3 flex-1">
+                <div className="bg-emerald-50 rounded-lg p-3 text-center">
+                  <p className="text-xs text-emerald-600">Total Diterima</p>
+                  <p className="text-2xl font-bold text-emerald-700">{detailData.total_received}</p>
+                </div>
+                <div className={`rounded-lg p-3 text-center ${detailData.total_missing > 0 ? 'bg-red-50' : 'bg-slate-50'}`}>
+                  <p className={`text-xs ${detailData.total_missing > 0 ? 'text-red-600' : 'text-slate-500'}`}>Total Missing</p>
+                  <p className={`text-2xl font-bold ${detailData.total_missing > 0 ? 'text-red-700' : 'text-slate-500'}`}>{detailData.total_missing}</p>
+                </div>
+                <div className="bg-slate-50 rounded-lg p-3 text-center">
+                  <p className="text-xs text-slate-500">Tanggal Inspeksi</p>
+                  <p className="text-sm font-bold text-slate-700">{fmtDate(detailData.inspection_date)}</p>
+                </div>
               </div>
-              <div className={`rounded-lg p-3 text-center ${detailData.total_missing > 0 ? 'bg-red-50' : 'bg-slate-50'}`}>
-                <p className={`text-xs ${detailData.total_missing > 0 ? 'text-red-600' : 'text-slate-500'}`}>Total Missing</p>
-                <p className={`text-2xl font-bold ${detailData.total_missing > 0 ? 'text-red-700' : 'text-slate-500'}`}>{detailData.total_missing}</p>
-              </div>
-              <div className="bg-slate-50 rounded-lg p-3 text-center">
-                <p className="text-xs text-slate-500">Tanggal Inspeksi</p>
-                <p className="text-sm font-bold text-slate-700">{fmtDate(detailData.inspection_date)}</p>
-              </div>
+              <a href={`/api/export-pdf?type=vendor-inspection&id=${detailData.id}`} target="_blank" rel="noreferrer"
+                className="ml-3 px-4 py-2 bg-blue-600 text-white text-sm rounded-lg font-medium hover:bg-blue-700 flex items-center gap-1.5 flex-shrink-0" data-testid="export-inspection-pdf">
+                PDF Export
+              </a>
             </div>
             {detailData.overall_notes && (
               <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-sm text-blue-800">
@@ -1901,6 +1970,32 @@ function VendorMaterialInspection({ token, user }) {
                       </tr>
                     ))}
                   </tbody>
+                </table>
+              </div>
+            )}
+            {/* Accessory items in detail */}
+            {(detailData.accessory_items || []).length > 0 && (
+              <div className="overflow-x-auto">
+                <h5 className="text-sm font-semibold text-emerald-700 mb-2">Aksesoris ({detailData.accessory_items.length} item)</h5>
+                <table className="w-full text-sm">
+                  <thead><tr className="bg-emerald-50">
+                    <th className="text-left px-3 py-2 text-xs text-emerald-700">Aksesoris</th>
+                    <th className="text-left px-3 py-2 text-xs text-emerald-700">Kode</th>
+                    <th className="text-right px-3 py-2 text-xs">Dibutuhkan</th>
+                    <th className="text-right px-3 py-2 text-xs text-emerald-700">Diterima</th>
+                    <th className="text-right px-3 py-2 text-xs text-red-600">Missing</th>
+                    <th className="text-left px-3 py-2 text-xs">Catatan</th>
+                  </tr></thead>
+                  <tbody>{detailData.accessory_items.map(acc => (
+                    <tr key={acc.id} className="border-t border-emerald-100">
+                      <td className="px-3 py-2 font-medium text-xs">{acc.accessory_name}</td>
+                      <td className="px-3 py-2 font-mono text-xs text-emerald-600">{acc.accessory_code || '-'}</td>
+                      <td className="px-3 py-2 text-right">{acc.ordered_qty} {acc.unit || 'pcs'}</td>
+                      <td className="px-3 py-2 text-right text-emerald-700 font-medium">{acc.received_qty}</td>
+                      <td className={`px-3 py-2 text-right font-medium ${acc.missing_qty > 0 ? 'text-red-600' : 'text-slate-400'}`}>{acc.missing_qty}</td>
+                      <td className="px-3 py-2 text-xs text-slate-500">{acc.condition_notes || '-'}</td>
+                    </tr>
+                  ))}</tbody>
                 </table>
               </div>
             )}

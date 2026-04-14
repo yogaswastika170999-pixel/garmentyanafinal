@@ -122,7 +122,7 @@ async def login(request: Request):
 
 @api.get("/auth/me")
 async def auth_me(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     u = await db.users.find_one({'id': user['id']}, {'password': 0, '_id': 0})
     # Include user permissions for RBAC
@@ -147,7 +147,7 @@ async def auth_me(request: Request):
 # ─── GARMENTS ────────────────────────────────────────────────────────────────
 @api.get("/garments")
 async def get_garments(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     query = {}
     sp = request.query_params
@@ -162,7 +162,7 @@ async def get_garments(request: Request):
 
 @api.get("/garments/{gid}")
 async def get_garment(gid: str, request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     doc = await db.garments.find_one({'id': gid}, {'_id': 0})
     if not doc: raise HTTPException(404, 'Not found')
@@ -170,7 +170,7 @@ async def get_garment(gid: str, request: Request):
 
 @api.post("/garments")
 async def create_garment(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -196,7 +196,7 @@ async def create_garment(request: Request):
 
 @api.put("/garments/{gid}")
 async def update_garment(gid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -210,7 +210,7 @@ async def update_garment(gid: str, request: Request):
 
 @api.delete("/garments/{gid}")
 async def delete_garment(gid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden: Only Superadmin can delete')
     db = get_db()
     doc = await db.garments.find_one({'id': gid})
@@ -228,7 +228,7 @@ async def delete_garment(gid: str, request: Request):
 # ─── BUYERS (Master Data) ────────────────────────────────────────────────────
 @api.get("/buyers")
 async def get_buyers(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     sp = request.query_params
     query = {}
@@ -244,7 +244,7 @@ async def get_buyers(request: Request):
 
 @api.get("/buyers/{bid}")
 async def get_buyer(bid: str, request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     doc = await db.buyers.find_one({'id': bid}, {'_id': 0})
     if not doc: raise HTTPException(404, 'Not found')
@@ -252,7 +252,7 @@ async def get_buyer(bid: str, request: Request):
 
 @api.post("/buyers")
 async def create_buyer(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -283,7 +283,7 @@ async def create_buyer(request: Request):
 
 @api.put("/buyers/{bid}")
 async def update_buyer(bid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -296,7 +296,7 @@ async def update_buyer(bid: str, request: Request):
 
 @api.delete("/buyers/{bid}")
 async def delete_buyer(bid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     doc = await db.buyers.find_one({'id': bid})
@@ -309,7 +309,7 @@ async def delete_buyer(bid: str, request: Request):
 # ─── PRODUCTS ────────────────────────────────────────────────────────────────
 @api.get("/products")
 async def get_products(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     sp = request.query_params
     query = {}
@@ -320,7 +320,7 @@ async def get_products(request: Request):
 
 @api.get("/products/{pid}")
 async def get_product(pid: str, request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     p = await db.products.find_one({'id': pid}, {'_id': 0})
     if not p: raise HTTPException(404, 'Not found')
@@ -331,7 +331,7 @@ async def get_product(pid: str, request: Request):
 
 @api.post("/products")
 async def create_product(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -342,7 +342,7 @@ async def create_product(request: Request):
 
 @api.put("/products/{pid}")
 async def update_product(pid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -353,7 +353,7 @@ async def update_product(pid: str, request: Request):
 
 @api.delete("/products/{pid}")
 async def delete_product(pid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     doc = await db.products.find_one({'id': pid})
@@ -363,10 +363,28 @@ async def delete_product(pid: str, request: Request):
     await log_activity(user['id'], user['name'], 'Delete', 'Products', f"Deleted product: {doc.get('product_name')}")
     return {'success': True}
 
+@api.post("/products/{pid}/photo")
+async def upload_product_photo(pid: str, request: Request, file: UploadFile = File(...)):
+    user = await require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    product = await db.products.find_one({'id': pid})
+    if not product: raise HTTPException(404, 'Product not found')
+    import base64
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024: raise HTTPException(400, 'File terlalu besar (maks 5MB)')
+    ext = (file.filename or '').rsplit('.', 1)[-1].lower() if file.filename else 'jpg'
+    if ext not in ('jpg', 'jpeg', 'png', 'webp', 'gif'): raise HTTPException(400, 'Format tidak didukung')
+    content_type = file.content_type or f'image/{ext}'
+    b64 = base64.b64encode(content).decode('utf-8')
+    photo_url = f"data:{content_type};base64,{b64}"
+    await db.products.update_one({'id': pid}, {'$set': {'photo_url': photo_url, 'updated_at': now()}})
+    return {'success': True, 'photo_url': photo_url}
+
 # ─── PRODUCT VARIANTS ────────────────────────────────────────────────────────
 @api.get("/product-variants")
 async def get_variants(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     query = {}
     pid = request.query_params.get('product_id')
@@ -375,7 +393,7 @@ async def get_variants(request: Request):
 
 @api.get("/product-variants/{vid}")
 async def get_variant(vid: str, request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     v = await db.product_variants.find_one({'id': vid}, {'_id': 0})
     if not v: raise HTTPException(404, 'Not found')
@@ -383,7 +401,7 @@ async def get_variant(vid: str, request: Request):
 
 @api.post("/product-variants")
 async def create_variant(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -401,7 +419,7 @@ async def create_variant(request: Request):
 
 @api.put("/product-variants/{vid}")
 async def update_variant(vid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -411,7 +429,7 @@ async def update_variant(vid: str, request: Request):
 
 @api.delete("/product-variants/{vid}")
 async def delete_variant(vid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     doc = await db.product_variants.find_one({'id': vid})
@@ -423,7 +441,7 @@ async def delete_variant(vid: str, request: Request):
 # ─── PRODUCTION POs ──────────────────────────────────────────────────────────
 @api.get("/production-pos")
 async def get_pos(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     sp = request.query_params
     query = {}
@@ -453,7 +471,7 @@ async def get_pos(request: Request):
 
 @api.get("/production-pos/{po_id}")
 async def get_po(po_id: str, request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     po = await db.production_pos.find_one({'id': po_id}, {'_id': 0})
     if not po: raise HTTPException(404, 'Not found')
@@ -468,7 +486,7 @@ async def get_po(po_id: str, request: Request):
 
 @api.post("/production-pos")
 async def create_po(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -522,7 +540,7 @@ async def create_po(request: Request):
 
 @api.post("/production-pos/{po_id}/close")
 async def close_po(po_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -538,7 +556,7 @@ async def close_po(po_id: str, request: Request):
 
 @api.put("/production-pos/{po_id}")
 async def update_po(po_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     existing = await db.production_pos.find_one({'id': po_id})
@@ -559,7 +577,7 @@ async def update_po(po_id: str, request: Request):
 
 @api.delete("/production-pos/{po_id}")
 async def delete_po(po_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     doc = await db.production_pos.find_one({'id': po_id})
@@ -571,7 +589,7 @@ async def delete_po(po_id: str, request: Request):
 # ─── PO ITEMS ────────────────────────────────────────────────────────────────
 @api.get("/po-items")
 async def get_po_items(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     query = {}
     po_id = request.query_params.get('po_id')
@@ -580,7 +598,7 @@ async def get_po_items(request: Request):
 
 @api.get("/po-items-produced")
 async def get_po_items_produced(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     po_id = request.query_params.get('po_id')
     if not po_id: raise HTTPException(400, 'po_id wajib diisi')
@@ -609,7 +627,7 @@ async def get_po_items_produced(request: Request):
 
 @api.put("/po-items/{item_id}")
 async def update_po_item(item_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -619,7 +637,7 @@ async def update_po_item(item_id: str, request: Request):
 
 @api.delete("/po-items/{item_id}")
 async def delete_po_item(item_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     await db.po_items.delete_one({'id': item_id})
@@ -628,7 +646,7 @@ async def delete_po_item(item_id: str, request: Request):
 # ─── VENDOR SHIPMENTS ────────────────────────────────────────────────────────
 @api.get("/vendor-shipments")
 async def get_vendor_shipments(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     query = {}
     if user.get('role') == 'vendor': query['vendor_id'] = user.get('vendor_id')
@@ -652,7 +670,7 @@ async def get_vendor_shipments(request: Request):
 
 @api.get("/vendor-shipments/{sid}")
 async def get_vendor_shipment(sid: str, request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     s = await db.vendor_shipments.find_one({'id': sid}, {'_id': 0})
     if not s: raise HTTPException(404, 'Not found')
@@ -685,7 +703,7 @@ async def get_vendor_shipment(sid: str, request: Request):
 
 @api.post("/vendor-shipments")
 async def create_vendor_shipment(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -755,7 +773,7 @@ async def create_vendor_shipment(request: Request):
 
 @api.put("/vendor-shipments/{sid}")
 async def update_vendor_shipment(sid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin', 'vendor']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -766,7 +784,7 @@ async def update_vendor_shipment(sid: str, request: Request):
 
 @api.delete("/vendor-shipments/{sid}")
 async def delete_vendor_shipment(sid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     doc = await db.vendor_shipments.find_one({'id': sid})
@@ -798,7 +816,7 @@ async def delete_vendor_shipment(sid: str, request: Request):
 # ─── VENDOR MATERIAL INSPECTIONS ─────────────────────────────────────────────
 @api.get("/vendor-material-inspections")
 async def get_inspections(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     query = {}
     sp = request.query_params
@@ -810,12 +828,15 @@ async def get_inspections(request: Request):
     for insp in inspections:
         shipment = await db.vendor_shipments.find_one({'id': insp.get('shipment_id')}) if insp.get('shipment_id') else None
         items = await db.vendor_material_inspection_items.find({'inspection_id': insp['id']}, {'_id': 0}).to_list(None)
-        result.append({**serialize_doc(insp), 'shipment_number': (shipment or {}).get('shipment_number', ''), 'items': serialize_doc(items)})
+        acc_items = await db.vendor_material_inspection_items.find({'inspection_id': insp['id'], 'item_type': 'accessory'}, {'_id': 0}).to_list(None)
+        result.append({**serialize_doc(insp), 'shipment_number': (shipment or {}).get('shipment_number', ''),
+                       'items': serialize_doc([i for i in items if i.get('item_type') != 'accessory']),
+                       'accessory_items': serialize_doc(acc_items)})
     return result
 
 @api.post("/vendor-material-inspections")
 async def create_inspection(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
@@ -826,14 +847,18 @@ async def create_inspection(request: Request):
     if existing: raise HTTPException(400, 'Inspeksi untuk shipment ini sudah dilakukan')
     inspection_id = new_id()
     items_data = body.get('items', [])
+    accessory_items_data = body.get('accessory_items', [])
     total_received = sum(int(i.get('received_qty', 0) or 0) for i in items_data)
     total_missing = sum(int(i.get('missing_qty', 0) or 0) for i in items_data)
+    total_acc_received = sum(int(a.get('received_qty', 0) or 0) for a in accessory_items_data)
+    total_acc_missing = sum(int(a.get('missing_qty', 0) or 0) for a in accessory_items_data)
     inspection = {
         'id': inspection_id, 'shipment_id': body['shipment_id'],
         'shipment_number': shipment.get('shipment_number', ''),
         'vendor_id': vendor_id, 'vendor_name': shipment.get('vendor_name', ''),
         'inspection_date': parse_date(body.get('inspection_date')) or now(),
         'total_received': total_received, 'total_missing': total_missing,
+        'total_acc_received': total_acc_received, 'total_acc_missing': total_acc_missing,
         'overall_notes': body.get('overall_notes', ''), 'status': 'Submitted',
         'submitted_by': user['name'], 'created_at': now(), 'updated_at': now()
     }
@@ -841,6 +866,7 @@ async def create_inspection(request: Request):
     for item in items_data:
         await db.vendor_material_inspection_items.insert_one({
             'id': new_id(), 'inspection_id': inspection_id,
+            'item_type': 'material',
             'shipment_item_id': item.get('shipment_item_id'),
             'sku': item.get('sku', ''), 'product_name': item.get('product_name', ''),
             'size': item.get('size', ''), 'color': item.get('color', ''),
@@ -848,6 +874,19 @@ async def create_inspection(request: Request):
             'received_qty': int(item.get('received_qty', 0) or 0),
             'missing_qty': int(item.get('missing_qty', 0) or 0),
             'condition_notes': item.get('condition_notes', ''), 'created_at': now()
+        })
+    for acc in accessory_items_data:
+        await db.vendor_material_inspection_items.insert_one({
+            'id': new_id(), 'inspection_id': inspection_id,
+            'item_type': 'accessory',
+            'accessory_id': acc.get('accessory_id', ''),
+            'accessory_name': acc.get('accessory_name', ''),
+            'accessory_code': acc.get('accessory_code', ''),
+            'unit': acc.get('unit', 'pcs'),
+            'ordered_qty': int(acc.get('ordered_qty', 0) or 0),
+            'received_qty': int(acc.get('received_qty', 0) or 0),
+            'missing_qty': int(acc.get('missing_qty', 0) or 0),
+            'condition_notes': acc.get('condition_notes', ''), 'created_at': now()
         })
     # Update shipment
     await db.vendor_shipments.update_one({'id': body['shipment_id']}, {'$set': {
@@ -895,16 +934,17 @@ async def create_inspection(request: Request):
                     'available_qty': avail, 'produced_qty': 0, 'created_at': now()
                 })
     await log_activity(user['id'], user['name'], 'Create', 'Material Inspection',
-                       f"Inspeksi shipment {shipment.get('shipment_number')}: diterima {total_received}, missing {total_missing}")
-    item_docs = await db.vendor_material_inspection_items.find({'inspection_id': inspection_id}, {'_id': 0}).to_list(None)
+                       f"Inspeksi shipment {shipment.get('shipment_number')}: diterima {total_received}, missing {total_missing}, acc diterima {total_acc_received}, acc missing {total_acc_missing}")
+    all_item_docs = await db.vendor_material_inspection_items.find({'inspection_id': inspection_id}, {'_id': 0}).to_list(None)
     result = serialize_doc(inspection)
-    result['items'] = serialize_doc(item_docs)
+    result['items'] = serialize_doc([i for i in all_item_docs if i.get('item_type') != 'accessory'])
+    result['accessory_items'] = serialize_doc([i for i in all_item_docs if i.get('item_type') == 'accessory'])
     return JSONResponse(result, status_code=201)
 
 # ─── PRODUCTION JOBS ─────────────────────────────────────────────────────────
 @api.get("/production-jobs")
 async def get_jobs(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     sp = request.query_params
     filt = {}
@@ -942,7 +982,7 @@ async def get_jobs(request: Request):
 
 @api.get("/production-jobs/{jid}")
 async def get_job(jid: str, request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     job = await db.production_jobs.find_one({'id': jid}, {'_id': 0})
     if not job: raise HTTPException(404, 'Not found')
@@ -961,7 +1001,7 @@ async def get_job(jid: str, request: Request):
 
 @api.post("/production-jobs")
 async def create_job(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
@@ -1041,7 +1081,7 @@ async def create_job(request: Request):
 
 @api.delete("/production-jobs/{jid}")
 async def delete_job(jid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     doc = await db.production_jobs.find_one({'id': jid})
@@ -1060,7 +1100,7 @@ async def delete_job(jid: str, request: Request):
 # ─── PRODUCTION JOB ITEMS ────────────────────────────────────────────────────
 @api.get("/production-job-items")
 async def get_job_items(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     job_id = request.query_params.get('job_id')
     if not job_id: raise HTTPException(400, 'job_id required')
@@ -1093,7 +1133,7 @@ async def get_job_items(request: Request):
 # ─── PRODUCTION PROGRESS ─────────────────────────────────────────────────────
 @api.get("/production-progress")
 async def get_progress(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     query = {}
     sp = request.query_params
@@ -1103,7 +1143,7 @@ async def get_progress(request: Request):
 
 @api.post("/production-progress")
 async def create_progress(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     if body.get('job_item_id'):
@@ -1159,7 +1199,7 @@ async def create_progress(request: Request):
 # ─── BUYER SHIPMENTS ─────────────────────────────────────────────────────────
 @api.get("/buyer-shipments")
 async def get_buyer_shipments(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     sp = request.query_params
     query = {}
@@ -1187,7 +1227,7 @@ async def get_buyer_shipments(request: Request):
 
 @api.get("/buyer-shipments/{bsid}")
 async def get_buyer_shipment(bsid: str, request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     s = await db.buyer_shipments.find_one({'id': bsid}, {'_id': 0})
     if not s: raise HTTPException(404, 'Not found')
@@ -1221,7 +1261,7 @@ async def get_buyer_shipment(bsid: str, request: Request):
 
 @api.post("/buyer-shipments")
 async def create_buyer_shipment(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
@@ -1281,7 +1321,7 @@ async def create_buyer_shipment(request: Request):
 
 @api.put("/buyer-shipments/{bsid}")
 async def update_buyer_shipment(bsid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     body.pop('_id', None); body.pop('id', None); body.pop('items', None)
@@ -1290,7 +1330,7 @@ async def update_buyer_shipment(bsid: str, request: Request):
 
 @api.delete("/buyer-shipments/{bsid}")
 async def delete_buyer_shipment(bsid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     doc = await db.buyer_shipments.find_one({'id': bsid})
@@ -1301,7 +1341,7 @@ async def delete_buyer_shipment(bsid: str, request: Request):
 
 @api.get("/buyer-shipment-dispatches")
 async def get_dispatches(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     sid = request.query_params.get('shipment_id')
     if not sid: raise HTTPException(400, 'shipment_id required')
@@ -1318,7 +1358,7 @@ async def get_dispatches(request: Request):
 # ─── INVOICES ────────────────────────────────────────────────────────────────
 @api.get("/invoices")
 async def get_invoices(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     sp = request.query_params
     query = {}
@@ -1336,7 +1376,7 @@ async def get_invoices(request: Request):
 
 @api.get("/invoices/{inv_id}")
 async def get_invoice(inv_id: str, request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     inv = await db.invoices.find_one({'id': inv_id}, {'_id': 0})
     if not inv: raise HTTPException(404, 'Not found')
@@ -1353,7 +1393,7 @@ async def get_invoice(inv_id: str, request: Request):
 
 @api.post("/invoices")
 async def create_invoice(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin', 'finance']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -1393,7 +1433,7 @@ async def create_invoice(request: Request):
 
 @api.put("/invoices/{inv_id}")
 async def update_invoice(inv_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin', 'finance']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -1403,7 +1443,7 @@ async def update_invoice(inv_id: str, request: Request):
 
 @api.delete("/invoices/{inv_id}")
 async def delete_invoice(inv_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     doc = await db.invoices.find_one({'id': inv_id})
@@ -1416,7 +1456,7 @@ async def delete_invoice(inv_id: str, request: Request):
 # ─── INVOICE ADJUSTMENTS ─────────────────────────────────────────────────────
 @api.get("/invoice-adjustments")
 async def get_adjustments(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     inv_id = request.query_params.get('invoice_id')
     if not inv_id: raise HTTPException(400, 'invoice_id required')
@@ -1424,7 +1464,7 @@ async def get_adjustments(request: Request):
 
 @api.post("/invoice-adjustments")
 async def create_adjustment(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin', 'finance', 'superadmin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -1458,7 +1498,7 @@ async def create_adjustment(request: Request):
 
 @api.delete("/invoice-adjustments/{adj_id}")
 async def delete_adjustment(adj_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     doc = await db.invoice_adjustments.find_one({'id': adj_id})
@@ -1479,7 +1519,7 @@ async def delete_adjustment(adj_id: str, request: Request):
 # ─── PAYMENTS ────────────────────────────────────────────────────────────────
 @api.get("/payments")
 async def get_payments(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     sp = request.query_params
     query = {}
@@ -1489,7 +1529,7 @@ async def get_payments(request: Request):
 
 @api.post("/payments")
 async def create_payment(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin', 'finance']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -1524,7 +1564,7 @@ async def create_payment(request: Request):
 
 @api.delete("/payments/{pay_id}")
 async def delete_payment(pay_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     doc = await db.payments.find_one({'id': pay_id})
@@ -1543,14 +1583,14 @@ async def delete_payment(pay_id: str, request: Request):
 # ─── USERS ───────────────────────────────────────────────────────────────────
 @api.get("/users")
 async def get_users(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     return serialize_doc(await db.users.find({}, {'password': 0, '_id': 0}).sort('created_at', -1).to_list(None))
 
 @api.post("/users")
 async def create_user(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -1562,7 +1602,7 @@ async def create_user(request: Request):
 
 @api.put("/users/{uid}")
 async def update_user(uid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -1573,7 +1613,7 @@ async def update_user(uid: str, request: Request):
 
 @api.delete("/users/{uid}")
 async def delete_user(uid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     doc = await db.users.find_one({'id': uid})
@@ -1586,7 +1626,7 @@ async def delete_user(uid: str, request: Request):
 # ─── ACTIVITY LOGS ───────────────────────────────────────────────────────────
 @api.get("/activity-logs")
 async def get_activity_logs(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     sp = request.query_params
@@ -1597,7 +1637,7 @@ async def get_activity_logs(request: Request):
 
 @api.delete("/activity-logs/{log_id}")
 async def delete_activity_log(log_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     if log_id == 'all':
@@ -1609,7 +1649,7 @@ async def delete_activity_log(log_id: str, request: Request):
 # ─── COMPANY SETTINGS ────────────────────────────────────────────────────────
 @api.get("/company-settings")
 async def get_company_settings(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     settings = await db.company_settings.find_one({'type': 'general'}, {'_id': 0})
     if not settings:
@@ -1625,7 +1665,7 @@ async def get_company_settings(request: Request):
 
 @api.post("/company-settings")
 async def save_company_settings(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -1647,7 +1687,7 @@ async def save_company_settings(request: Request):
 # ─── MATERIAL REQUESTS ──────────────────────────────────────────────────────
 @api.get("/material-requests")
 async def get_material_requests(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     query = {}
     sp = request.query_params
@@ -1658,7 +1698,7 @@ async def get_material_requests(request: Request):
 
 @api.post("/material-requests")
 async def create_material_request(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
@@ -1701,7 +1741,7 @@ async def create_material_request(request: Request):
 
 @api.put("/material-requests/{req_id}")
 async def update_material_request(req_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -1780,7 +1820,7 @@ async def update_material_request(req_id: str, request: Request):
 # ─── MATERIAL DEFECT REPORTS ─────────────────────────────────────────────────
 @api.get("/material-defect-reports")
 async def get_defect_reports(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     query = {}
     if user.get('role') == 'vendor': query['vendor_id'] = user.get('vendor_id')
@@ -1789,7 +1829,7 @@ async def get_defect_reports(request: Request):
 
 @api.post("/material-defect-reports")
 async def create_defect_report(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
@@ -1818,7 +1858,7 @@ async def create_defect_report(request: Request):
 # ─── PRODUCTION RETURNS ──────────────────────────────────────────────────────
 @api.get("/production-returns")
 async def get_returns(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     sp = request.query_params
     query = {}
@@ -1832,7 +1872,7 @@ async def get_returns(request: Request):
 
 @api.get("/production-returns/{ret_id}")
 async def get_return(ret_id: str, request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     ret = await db.production_returns.find_one({'id': ret_id}, {'_id': 0})
     if not ret: raise HTTPException(404, 'Not found')
@@ -1843,7 +1883,7 @@ async def get_return(ret_id: str, request: Request):
 
 @api.post("/production-returns")
 async def create_return(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -1886,7 +1926,7 @@ async def create_return(request: Request):
 
 @api.put("/production-returns/{ret_id}")
 async def update_return(ret_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -1897,7 +1937,7 @@ async def update_return(ret_id: str, request: Request):
 
 @api.delete("/production-returns/{ret_id}")
 async def delete_return(ret_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     doc = await db.production_returns.find_one({'id': ret_id})
@@ -1909,7 +1949,7 @@ async def delete_return(ret_id: str, request: Request):
 # ─── DASHBOARD ───────────────────────────────────────────────────────────────
 @api.get("/dashboard")
 async def get_dashboard(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     n = now()
     three_days = n + timedelta(days=3)
@@ -2078,10 +2118,108 @@ async def get_dashboard(request: Request):
         }
     }
 
+@api.get("/dashboard/analytics")
+async def get_dashboard_analytics(request: Request):
+    """Enhanced analytics with date range filter"""
+    user = await require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    date_from = parse_date(sp.get('from'))
+    date_to = to_end_of_day(sp.get('to'))
+    date_filter = {}
+    if date_from: date_filter['$gte'] = date_from
+    if date_to: date_filter['$lte'] = date_to
+    date_q = {'created_at': date_filter} if date_filter else {}
+    # Vendor lead times (shipment sent → received)
+    vendor_lead_times = []
+    ships = await db.vendor_shipments.find({**date_q, 'status': 'Received', 'shipment_type': 'NORMAL'}, {'_id': 0}).to_list(None)
+    vendor_lt_map = {}
+    for s in ships:
+        vn = s.get('vendor_name', 'Unknown')
+        if s.get('shipment_date') and s.get('updated_at'):
+            delta = (s['updated_at'] - s['shipment_date']).days if isinstance(s['updated_at'], datetime) and isinstance(s['shipment_date'], datetime) else 0
+            if delta >= 0:
+                if vn not in vendor_lt_map: vendor_lt_map[vn] = []
+                vendor_lt_map[vn].append(delta)
+    for vn, days_list in sorted(vendor_lt_map.items()):
+        avg_lt = round(sum(days_list) / len(days_list), 1) if days_list else 0
+        vendor_lead_times.append({'vendor': vn, 'avg_days': avg_lt, 'shipment_count': len(days_list)})
+    # Missing/defect rates by vendor
+    all_inspections = await db.vendor_material_inspections.find(date_q, {'_id': 0}).to_list(None)
+    vendor_defect_map = {}
+    for insp in all_inspections:
+        vn = insp.get('vendor_name', 'Unknown')
+        if vn not in vendor_defect_map: vendor_defect_map[vn] = {'received': 0, 'missing': 0}
+        vendor_defect_map[vn]['received'] += insp.get('total_received', 0)
+        vendor_defect_map[vn]['missing'] += insp.get('total_missing', 0)
+    defect_rates = []
+    for vn, vals in sorted(vendor_defect_map.items()):
+        total = vals['received'] + vals['missing']
+        rate = round((vals['missing'] / total * 100) if total > 0 else 0, 1)
+        defect_rates.append({'vendor': vn, 'missing_rate': rate, 'total_received': vals['received'], 'total_missing': vals['missing']})
+    # Production throughput by week
+    weekly_throughput = []
+    n = now()
+    for w in range(7, -1, -1):
+        start = n - timedelta(days=(w + 1) * 7)
+        end = n - timedelta(days=w * 7)
+        prog_agg = await db.production_progress.aggregate([
+            {'$match': {'progress_date': {'$gte': start, '$lt': end}}},
+            {'$group': {'_id': None, 'total': {'$sum': '$completed_quantity'}}}
+        ]).to_list(None)
+        weekly_throughput.append({
+            'week': f"W{8-w}", 'label': start.strftime('%d/%m'),
+            'qty': prog_agg[0]['total'] if prog_agg else 0
+        })
+    # Production completion rate by product
+    product_completion = await db.production_job_items.aggregate([
+        {'$group': {'_id': '$product_name', 'total_available': {'$sum': '$available_qty'}, 'total_produced': {'$sum': '$produced_qty'}}},
+        {'$sort': {'total_available': -1}}, {'$limit': 10}
+    ]).to_list(None)
+    product_comp = [{'product': p['_id'] or 'Unknown',
+                     'available': p.get('total_available', 0),
+                     'produced': p.get('total_produced', 0),
+                     'rate': round((p['total_produced'] / p['total_available'] * 100) if p.get('total_available', 0) > 0 else 0, 1)
+                     } for p in product_completion]
+    # Shipment status breakdown
+    ship_status_agg = await db.vendor_shipments.aggregate([
+        {'$group': {'_id': '$status', 'count': {'$sum': 1}}}
+    ]).to_list(None)
+    # PO deadline distribution
+    all_pos = await db.production_pos.find({'status': {'$nin': ['Closed', 'Draft']}}, {'_id': 0, 'deadline': 1, 'po_number': 1}).to_list(None)
+    overdue_count = 0
+    this_week_count = 0
+    next_week_count = 0
+    later_count = 0
+    for p in all_pos:
+        dl = p.get('deadline')
+        if not dl: continue
+        if isinstance(dl, str):
+            dl = parse_date(dl)
+        if not isinstance(dl, datetime): continue
+        # Ensure timezone-aware comparison
+        if dl.tzinfo is None:
+            dl = dl.replace(tzinfo=timezone.utc)
+        if dl < n: overdue_count += 1
+        elif dl < n + timedelta(days=7): this_week_count += 1
+        elif dl < n + timedelta(days=14): next_week_count += 1
+        else: later_count += 1
+    return {
+        'vendorLeadTimes': vendor_lead_times,
+        'defectRates': defect_rates,
+        'weeklyThroughput': weekly_throughput,
+        'productCompletion': product_comp,
+        'shipmentStatus': [{'status': s['_id'] or 'Unknown', 'count': s['count']} for s in ship_status_agg],
+        'deadlineDistribution': {
+            'overdue': overdue_count, 'thisWeek': this_week_count,
+            'nextWeek': next_week_count, 'later': later_count
+        }
+    }
+
 # ─── VENDOR DASHBOARD ────────────────────────────────────────────────────────
 @api.get("/vendor/dashboard")
 async def get_vendor_dashboard(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'vendor': raise HTTPException(403, 'Forbidden')
     db = get_db()
     vendor_id = user.get('vendor_id')
@@ -2104,7 +2242,7 @@ async def get_vendor_dashboard(request: Request):
 # ─── GLOBAL SEARCH ───────────────────────────────────────────────────────────
 @api.get("/global-search")
 async def global_search(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     q = request.query_params.get('q', '').strip()
     if not q: return {'results': []}
@@ -2129,7 +2267,7 @@ async def global_search(request: Request):
 # ─── ATTACHMENTS ─────────────────────────────────────────────────────────────
 @api.get("/attachments")
 async def get_attachments(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     sp = request.query_params
     entity_type = sp.get('entity_type')
@@ -2140,7 +2278,7 @@ async def get_attachments(request: Request):
 # ─── FINANCIAL RECAP ─────────────────────────────────────────────────────────
 @api.get("/financial-recap")
 async def financial_recap(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     sp = request.query_params
     inv_query = {}
@@ -2189,20 +2327,20 @@ async def financial_recap(request: Request):
 # ─── ACCOUNTS PAYABLE / RECEIVABLE ──────────────────────────────────────────
 @api.get("/accounts-payable")
 async def accounts_payable(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     return serialize_doc(await db.invoices.find({'invoice_category': 'VENDOR'}, {'_id': 0}).sort('created_at', -1).to_list(None))
 
 @api.get("/accounts-receivable")
 async def accounts_receivable(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     return serialize_doc(await db.invoices.find({'invoice_category': 'BUYER'}, {'_id': 0}).sort('created_at', -1).to_list(None))
 
 # ─── REPORTS ─────────────────────────────────────────────────────────────────
 @api.get("/reports/{report_type}")
 async def get_report(report_type: str, request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     sp = request.query_params
     if report_type == 'production':
@@ -2351,7 +2489,7 @@ async def get_report(report_type: str, request: Request):
 # ─── PRODUCTION MONITORING V2 ────────────────────────────────────────────────
 @api.get("/production-monitoring-v2")
 async def production_monitoring(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     sp = request.query_params
     g_query = {'status': 'active'}
@@ -2393,7 +2531,7 @@ async def production_monitoring(request: Request):
 # ─── DISTRIBUSI KERJA ────────────────────────────────────────────────────────
 @api.get("/distribusi-kerja")
 async def distribusi_kerja(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     sp = request.query_params
     # Get all POs (or filtered by vendor)
@@ -2483,7 +2621,7 @@ async def distribusi_kerja(request: Request):
 # ─── WORK ORDERS ─────────────────────────────────────────────────────────────
 @api.get("/work-orders")
 async def get_work_orders(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     sp = request.query_params
     query = {}
@@ -2495,7 +2633,7 @@ async def get_work_orders(request: Request):
 
 @api.post("/work-orders")
 async def create_work_order(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -2519,7 +2657,7 @@ async def create_work_order(request: Request):
 
 @api.delete("/work-orders/{woid}")
 async def delete_work_order(woid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     doc = await db.work_orders.find_one({'id': woid})
@@ -2531,7 +2669,7 @@ async def delete_work_order(woid: str, request: Request):
 # ─── RECALCULATE JOBS ────────────────────────────────────────────────────────
 @api.post("/recalculate-jobs")
 async def recalculate_jobs(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     fixed = 0
@@ -2599,7 +2737,7 @@ async def recalculate_jobs(request: Request):
 # ─── IMPORT DATA ─────────────────────────────────────────────────────────────
 @api.post("/import-data")
 async def import_data(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -2686,7 +2824,7 @@ async def import_data(request: Request):
 
 @api.get("/import-template")
 async def import_template(request: Request):
-    require_auth(request)
+    await require_auth(request)
     ttype = request.query_params.get('type', '')
     templates = {
         'products': {'columns': ['product_code', 'product_name', 'category', 'cmt_price', 'selling_price'],
@@ -2706,7 +2844,7 @@ async def import_template(request: Request):
 # ─── EXPORT EXCEL ────────────────────────────────────────────────────────────
 @api.get("/export-excel")
 async def export_excel(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     sp = request.query_params
     export_type = sp.get('type', '')
@@ -2935,7 +3073,7 @@ def _filter_columns(headers, all_col_keys, selected_keys, data_rows):
 
 @api.get("/export-pdf")
 async def export_pdf(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     sp = request.query_params
     pdf_type = sp.get('type', '')
@@ -3060,6 +3198,100 @@ async def export_pdf(request: Request):
             _build_pdf(buf, elements)
             return StreamingResponse(buf, media_type="application/pdf",
                                      headers={"Content-Disposition": f"attachment; filename=SJ-Material-{ship.get('shipment_number','')}.pdf"})
+
+        # ──── VENDOR INSPECTION PDF ────
+        elif pdf_type == 'vendor-inspection':
+            insp_id = sp.get('id')
+            if not insp_id: raise HTTPException(400, 'id required')
+            insp = await db.vendor_material_inspections.find_one({'id': insp_id}, {'_id': 0})
+            if not insp: raise HTTPException(404, 'Inspection not found')
+            shipment = await db.vendor_shipments.find_one({'id': insp.get('shipment_id')}, {'_id': 0})
+            # Get PO info
+            po_id = (shipment or {}).get('po_id', '')
+            if not po_id:
+                first_si = await db.vendor_shipment_items.find_one({'shipment_id': insp.get('shipment_id')})
+                if first_si: po_id = first_si.get('po_id', '')
+            po = await db.production_pos.find_one({'id': po_id}, {'_id': 0}) if po_id else None
+            # Get invoice if linked
+            invoice = await db.invoices.find_one({'po_id': po_id, 'invoice_category': 'AP'}, {'_id': 0}) if po_id else None
+            # Get all inspection items
+            all_insp_items = await db.vendor_material_inspection_items.find({'inspection_id': insp_id}, {'_id': 0}).to_list(None)
+            material_items = [i for i in all_insp_items if i.get('item_type') != 'accessory']
+            accessory_items = [i for i in all_insp_items if i.get('item_type') == 'accessory']
+            elements = []
+            info_pairs = [
+                ('No PO', (po or {}).get('po_number', '-')),
+                ('No Invoice', (invoice or {}).get('invoice_number', '-')),
+                ('Vendor', insp.get('vendor_name', '')),
+                ('Tanggal Inspeksi', _fmt_date(insp.get('inspection_date'))),
+                ('No Shipment', insp.get('shipment_number', '')),
+                ('Status', insp.get('status', '')),
+            ]
+            _pdf_header(elements, company_name, 'Laporan Inspeksi Material (Vendor)', info_pairs=info_pairs)
+            # Material items table
+            if material_items:
+                elements.append(Paragraph("<b>Material Items:</b>", styles['Heading3']))
+                headers = ['No', 'Produk', 'SKU', 'Size', 'Warna', 'Qty Dikirim', 'Qty Diterima', 'Qty Missing', 'Catatan']
+                data_rows = []
+                for idx, item in enumerate(material_items, 1):
+                    # Get product info for category
+                    prod = await db.products.find_one({'product_name': item.get('product_name')}, {'_id': 0})
+                    category = (prod or {}).get('category', '-')
+                    data_rows.append([
+                        idx, f"{item.get('product_name', '')}\n({category})",
+                        item.get('sku', ''), item.get('size', ''), item.get('color', ''),
+                        item.get('ordered_qty', 0), item.get('received_qty', 0),
+                        item.get('missing_qty', 0), _safe_str(item.get('condition_notes', ''))
+                    ])
+                td = [headers] + data_rows
+                total_row = ['', '', '', '', 'TOTAL',
+                    sum(i.get('ordered_qty', 0) for i in material_items),
+                    sum(i.get('received_qty', 0) for i in material_items),
+                    sum(i.get('missing_qty', 0) for i in material_items), '']
+                td.append(total_row)
+                cw = [25, 90, 60, 40, 50, 55, 55, 55, 90]
+                t = Table(td, colWidths=cw, repeatRows=1)
+                t.setStyle(_pdf_table_style())
+                t.setStyle(_pdf_total_row_style())
+                elements.append(t)
+            # Accessory items table
+            if accessory_items:
+                elements.append(Spacer(1, 6*mm))
+                elements.append(Paragraph("<b>Aksesoris Items:</b>", styles['Heading3']))
+                acc_headers = ['No', 'Aksesoris', 'Kode', 'Satuan', 'Qty Dikirim', 'Qty Diterima', 'Qty Missing', 'Catatan']
+                acc_rows = []
+                for idx, acc in enumerate(accessory_items, 1):
+                    acc_rows.append([
+                        idx, acc.get('accessory_name', ''), acc.get('accessory_code', ''),
+                        acc.get('unit', 'pcs'), acc.get('ordered_qty', 0),
+                        acc.get('received_qty', 0), acc.get('missing_qty', 0),
+                        _safe_str(acc.get('condition_notes', ''))
+                    ])
+                acc_td = [acc_headers] + acc_rows
+                acc_total = ['', '', '', 'TOTAL',
+                    sum(a.get('ordered_qty', 0) for a in accessory_items),
+                    sum(a.get('received_qty', 0) for a in accessory_items),
+                    sum(a.get('missing_qty', 0) for a in accessory_items), '']
+                acc_td.append(acc_total)
+                acc_cw = [25, 100, 70, 45, 60, 60, 60, 90]
+                at = Table(acc_td, colWidths=acc_cw, repeatRows=1)
+                at.setStyle(_pdf_table_style())
+                at.setStyle(_pdf_total_row_style())
+                elements.append(at)
+            if insp.get('overall_notes'):
+                elements.append(Spacer(1, 4*mm))
+                elements.append(Paragraph(f"<b>Catatan Umum:</b> {insp.get('overall_notes', '')}", styles['Normal']))
+            # Signature
+            elements.append(Spacer(1, 12*mm))
+            sig_data = [['Inspektor', '', 'Pengirim (Vendor)'], ['', '', ''], ['_________________', '', '_________________']]
+            st = Table(sig_data, colWidths=[180, 100, 180])
+            st.setStyle(TableStyle([('ALIGN', (0, 0), (-1, -1), 'CENTER'), ('FONTSIZE', (0, 0), (-1, -1), 9)]))
+            elements.append(st)
+            _pdf_footer(elements)
+            _build_pdf(buf, elements, page='landscape')
+            fname = f"Inspeksi-{insp.get('shipment_number', 'unknown')}.pdf"
+            return StreamingResponse(buf, media_type="application/pdf",
+                                     headers={"Content-Disposition": f"attachment; filename={fname}"})
 
         # ──── BUYER SHIPMENT DISPATCH ────
         elif pdf_type == 'buyer-shipment-dispatch':
@@ -3693,7 +3925,7 @@ PDF_COLUMN_DEFINITIONS = {
 @api.get("/pdf-export-columns")
 async def get_pdf_export_columns(request: Request):
     """Get available columns for a PDF type."""
-    require_auth(request)
+    await require_auth(request)
     pdf_type = request.query_params.get('type', '')
     if pdf_type in PDF_COLUMN_DEFINITIONS:
         return {'pdf_type': pdf_type, 'columns': PDF_COLUMN_DEFINITIONS[pdf_type]}
@@ -3702,7 +3934,7 @@ async def get_pdf_export_columns(request: Request):
 @api.get("/pdf-export-configs")
 async def list_pdf_export_configs(request: Request):
     """List all PDF export configurations."""
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     pdf_type = request.query_params.get('type')
     query = {}
@@ -3712,7 +3944,7 @@ async def list_pdf_export_configs(request: Request):
 
 @api.get("/pdf-export-configs/{config_id}")
 async def get_pdf_export_config(config_id: str, request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     cfg = await db.pdf_export_configs.find_one({'id': config_id}, {'_id': 0})
     if not cfg: raise HTTPException(404, 'Config not found')
@@ -3721,7 +3953,7 @@ async def get_pdf_export_config(config_id: str, request: Request):
 @api.post("/pdf-export-configs")
 async def create_pdf_export_config(request: Request):
     """Create a new PDF export config."""
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     pdf_type = body.get('pdf_type', '')
@@ -3755,7 +3987,7 @@ async def create_pdf_export_config(request: Request):
 
 @api.put("/pdf-export-configs/{config_id}")
 async def update_pdf_export_config(config_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     existing = await db.pdf_export_configs.find_one({'id': config_id})
@@ -3781,7 +4013,7 @@ async def update_pdf_export_config(config_id: str, request: Request):
 
 @api.delete("/pdf-export-configs/{config_id}")
 async def delete_pdf_export_config(config_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     existing = await db.pdf_export_configs.find_one({'id': config_id})
     if not existing: raise HTTPException(404, 'Config not found')
@@ -3795,7 +4027,7 @@ async def delete_pdf_export_config(config_id: str, request: Request):
 @api.post("/production-pos/{po_id}/status")
 async def transition_po_status(po_id: str, request: Request):
     """Transition PO through staged statuses."""
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -3819,7 +4051,7 @@ async def transition_po_status(po_id: str, request: Request):
 @api.get("/production-pos/{po_id}/quantity-summary")
 async def po_quantity_summary(po_id: str, request: Request):
     """Get comprehensive quantity summary for a PO."""
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     po = await db.production_pos.find_one({'id': po_id}, {'_id': 0})
     if not po: raise HTTPException(404, 'PO not found')
@@ -3878,10 +4110,77 @@ async def po_quantity_summary(po_id: str, request: Request):
     return {'po': serialize_doc(po), 'items': summary_items, 'totals': totals}
 
 # ─── SERIAL TRACKING TIMELINE ───────────────────────────────────────────────
+@api.get("/serial-list")
+async def serial_list(request: Request):
+    """Get list of all serial numbers with status info."""
+    user = await require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    search = sp.get('search', '').strip()
+    status_filter = sp.get('status', '')  # ongoing, completed, all
+    # Build query
+    query = {}
+    if search:
+        query['serial_number'] = {'$regex': search, '$options': 'i'}
+    if user.get('role') == 'vendor':
+        # Only show serials for vendor's POs
+        vendor_pos = await db.production_pos.find({'vendor_id': user.get('vendor_id')}, {'id': 1}).to_list(None)
+        vendor_po_ids = [p['id'] for p in vendor_pos]
+        query['po_id'] = {'$in': vendor_po_ids}
+    po_items = await db.po_items.find(query, {'_id': 0}).sort('created_at', -1).to_list(None)
+    result = []
+    for item in po_items:
+        if not item.get('serial_number'): continue
+        po = await db.production_pos.find_one({'id': item.get('po_id')}, {'_id': 0})
+        # Get production status
+        ji_list = await db.production_job_items.find({'po_item_id': item['id']}).to_list(None)
+        produced = sum(j.get('produced_qty', 0) for j in ji_list)
+        # Get shipment status
+        bi_list = await db.buyer_shipment_items.find({'po_item_id': item['id']}).to_list(None)
+        shipped = sum(b.get('qty_shipped', 0) for b in bi_list)
+        ordered = item.get('qty', 0)
+        remaining = max(0, ordered - shipped)
+        # Determine status
+        if shipped >= ordered:
+            serial_status = 'completed'
+        elif produced > 0 or ji_list:
+            serial_status = 'ongoing'
+        else:
+            serial_status = 'pending'
+        if status_filter and status_filter != 'all' and serial_status != status_filter:
+            continue
+        # Get vendor shipment info
+        vs_items = await db.vendor_shipment_items.find({'po_item_id': item['id']}).to_list(None)
+        received_qty = 0
+        for vsi in vs_items:
+            insp = await db.vendor_material_inspection_items.find_one({'shipment_item_id': vsi['id']})
+            if insp: received_qty += insp.get('received_qty', 0)
+            else: received_qty += vsi.get('qty_sent', 0)
+        result.append({
+            'serial_number': item.get('serial_number'),
+            'po_number': (po or {}).get('po_number', ''),
+            'po_id': item.get('po_id'),
+            'customer_name': (po or {}).get('customer_name', ''),
+            'vendor_name': (po or {}).get('vendor_name', ''),
+            'product_name': item.get('product_name', ''),
+            'sku': item.get('sku', ''),
+            'size': item.get('size', ''),
+            'color': item.get('color', ''),
+            'ordered_qty': ordered,
+            'received_qty': received_qty,
+            'produced_qty': produced,
+            'shipped_qty': shipped,
+            'remaining_qty': remaining,
+            'status': serial_status,
+            'po_status': (po or {}).get('status', ''),
+            'deadline': serialize_doc((po or {}).get('deadline')),
+        })
+    return result
+
 @api.get("/serial-trace")
 async def serial_trace(request: Request):
     """Get full lifecycle timeline + PO-wide summary for a serial number."""
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     serial = request.query_params.get('serial', '').strip()
     if not serial: raise HTTPException(400, 'serial parameter required')
@@ -4032,7 +4331,7 @@ async def serial_trace(request: Request):
 # ─── ACCESSORY MANAGEMENT ───────────────────────────────────────────────────
 @api.get("/accessories")
 async def get_accessories(request: Request):
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     sp = request.query_params
     query = {}
@@ -4044,7 +4343,7 @@ async def get_accessories(request: Request):
 
 @api.post("/accessories")
 async def create_accessory(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -4056,7 +4355,7 @@ async def create_accessory(request: Request):
 
 @api.put("/accessories/{acc_id}")
 async def update_accessory(acc_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -4066,7 +4365,7 @@ async def update_accessory(acc_id: str, request: Request):
 
 @api.delete("/accessories/{acc_id}")
 async def delete_accessory(acc_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     await db.accessories.delete_one({'id': acc_id})
@@ -4075,7 +4374,7 @@ async def delete_accessory(acc_id: str, request: Request):
 # ─── ACCESSORY SHIPMENTS ────────────────────────────────────────────────────
 @api.get("/accessory-shipments")
 async def get_accessory_shipments(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     query = {}
     sp = request.query_params
@@ -4091,7 +4390,7 @@ async def get_accessory_shipments(request: Request):
 
 @api.post("/accessory-shipments")
 async def create_accessory_shipment(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -4128,7 +4427,7 @@ async def create_accessory_shipment(request: Request):
 
 @api.put("/accessory-shipments/{sid}")
 async def update_accessory_shipment(sid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     body.pop('_id', None); body.pop('id', None); body.pop('items', None)
@@ -4137,7 +4436,7 @@ async def update_accessory_shipment(sid: str, request: Request):
 
 @api.delete("/accessory-shipments/{sid}")
 async def delete_accessory_shipment(sid: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     await db.accessory_shipment_items.delete_many({'shipment_id': sid})
@@ -4147,7 +4446,7 @@ async def delete_accessory_shipment(sid: str, request: Request):
 # ─── ACCESSORY INSPECTIONS ───────────────────────────────────────────────────
 @api.get("/accessory-inspections")
 async def get_acc_inspections(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     query = {}
     sp = request.query_params
@@ -4158,7 +4457,7 @@ async def get_acc_inspections(request: Request):
 
 @api.post("/accessory-inspections")
 async def create_acc_inspection(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
@@ -4204,7 +4503,7 @@ async def create_acc_inspection(request: Request):
 # ─── ACCESSORY DEFECTS ──────────────────────────────────────────────────────
 @api.get("/accessory-defects")
 async def get_acc_defects(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     query = {}
     if user.get('role') == 'vendor': query['vendor_id'] = user.get('vendor_id')
@@ -4213,7 +4512,7 @@ async def get_acc_defects(request: Request):
 
 @api.post("/accessory-defects")
 async def create_acc_defect(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
@@ -4237,7 +4536,7 @@ async def create_acc_defect(request: Request):
 # ─── ACCESSORY REQUESTS ─────────────────────────────────────────────────────
 @api.get("/accessory-requests")
 async def get_acc_requests(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     query = {}
     sp = request.query_params
@@ -4248,7 +4547,7 @@ async def get_acc_requests(request: Request):
 
 @api.post("/accessory-requests")
 async def create_acc_request(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
@@ -4275,7 +4574,7 @@ async def create_acc_request(request: Request):
 
 @api.put("/accessory-requests/{req_id}")
 async def update_acc_request(req_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -4329,7 +4628,7 @@ async def update_acc_request(req_id: str, request: Request):
 # ─── REMINDER SYSTEM ─────────────────────────────────────────────────────────
 @api.get("/reminders")
 async def get_reminders(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     query = {}
     if user.get('role') == 'vendor':
@@ -4342,7 +4641,7 @@ async def get_reminders(request: Request):
 
 @api.post("/reminders")
 async def create_reminder(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -4365,7 +4664,7 @@ async def create_reminder(request: Request):
 
 @api.put("/reminders/{reminder_id}")
 async def update_reminder(reminder_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     body = await request.json()
     existing = await db.reminders.find_one({'id': reminder_id})
@@ -4386,7 +4685,7 @@ async def update_reminder(reminder_id: str, request: Request):
 
 @api.delete("/reminders/{reminder_id}")
 async def delete_reminder(reminder_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     await db.reminders.delete_one({'id': reminder_id})
@@ -4396,7 +4695,7 @@ async def delete_reminder(reminder_id: str, request: Request):
 # ─── RBAC ────────────────────────────────────────────────────────────────────
 @api.get("/roles")
 async def get_roles(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     roles = await db.roles.find({}, {'_id': 0}).sort('name', 1).to_list(None)
@@ -4408,7 +4707,7 @@ async def get_roles(request: Request):
 
 @api.post("/roles")
 async def create_role(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -4426,7 +4725,7 @@ async def create_role(request: Request):
 
 @api.put("/roles/{role_id}")
 async def update_role(role_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -4443,7 +4742,7 @@ async def update_role(role_id: str, request: Request):
 
 @api.delete("/roles/{role_id}")
 async def delete_role(role_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
     db = get_db()
     role = await db.roles.find_one({'id': role_id})
@@ -4454,7 +4753,7 @@ async def delete_role(role_id: str, request: Request):
 
 @api.get("/permissions")
 async def get_permissions(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     # Return available permission keys
     permissions = [
@@ -4499,7 +4798,7 @@ async def get_permissions(request: Request):
 @api.get("/po-accessories")
 async def get_po_accessories(request: Request):
     """Get accessories linked to a PO."""
-    require_auth(request)
+    await require_auth(request)
     db = get_db()
     po_id = request.query_params.get('po_id')
     if not po_id: raise HTTPException(400, 'po_id required')
@@ -4508,7 +4807,7 @@ async def get_po_accessories(request: Request):
 @api.post("/po-accessories")
 async def add_po_accessory(request: Request):
     """Add accessory to a PO."""
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -4535,7 +4834,7 @@ async def add_po_accessory(request: Request):
 
 @api.delete("/po-accessories/{acc_id}")
 async def remove_po_accessory(acc_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     await db.po_accessories.delete_one({'id': acc_id})

@@ -15,7 +15,7 @@ def now(): return datetime.now(timezone.utc)
 @router.post("/buyer/register")
 async def register_buyer(request: Request):
     """Admin creates a buyer account."""
-    user = require_auth(request)
+    user = await require_auth(request)
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
@@ -37,7 +37,7 @@ async def register_buyer(request: Request):
 # ─── BUYER DASHBOARD ─────────────────────────────────────────────────────────
 @router.get("/buyer/portal/dashboard")
 async def buyer_dashboard(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'buyer': raise HTTPException(403, 'Forbidden')
     db = get_db()
     customer_name = user.get('customer_name', user.get('name', ''))
@@ -78,7 +78,7 @@ async def buyer_dashboard(request: Request):
 # ─── BUYER PO LIST ───────────────────────────────────────────────────────────
 @router.get("/buyer/portal/pos")
 async def buyer_pos(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'buyer': raise HTTPException(403, 'Forbidden')
     db = get_db()
     customer_name = user.get('customer_name', user.get('name', ''))
@@ -93,7 +93,7 @@ async def buyer_pos(request: Request):
 # ─── BUYER SHIPMENT HISTORY ──────────────────────────────────────────────────
 @router.get("/buyer/portal/shipments")
 async def buyer_shipments(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'buyer': raise HTTPException(403, 'Forbidden')
     db = get_db()
     customer_name = user.get('customer_name', user.get('name', ''))
@@ -121,7 +121,7 @@ async def buyer_shipments(request: Request):
 # ─── BUYER DISPATCH DETAIL ───────────────────────────────────────────────────
 @router.get("/buyer/portal/shipments/{ship_id}")
 async def buyer_shipment_detail(ship_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'buyer': raise HTTPException(403, 'Forbidden')
     db = get_db()
     s = await db.buyer_shipments.find_one({'id': ship_id}, {'_id': 0})
@@ -145,7 +145,7 @@ async def buyer_shipment_detail(ship_id: str, request: Request):
 # ─── BUYER SERIAL TRACE ──────────────────────────────────────────────────────
 @router.get("/buyer/portal/serial-trace")
 async def buyer_serial_trace(request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     if user.get('role') != 'buyer': raise HTTPException(403, 'Forbidden')
     db = get_db()
     serial = request.query_params.get('serial', '').strip()

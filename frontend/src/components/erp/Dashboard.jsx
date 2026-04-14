@@ -11,7 +11,6 @@ function ClipboardList({ className }) {
   return <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>;
 }
 
-// Interactive KPI Card with click-to-expand
 function KPICard({ title, value, subtitle, icon: Icon, color, onClick, detail, badge }) {
   return (
     <button onClick={onClick} className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm hover:shadow-lg hover:border-blue-300 transition-all text-left w-full group" data-testid={`kpi-${title.replace(/\s+/g, '-').toLowerCase()}`}>
@@ -33,7 +32,6 @@ function KPICard({ title, value, subtitle, icon: Icon, color, onClick, detail, b
   );
 }
 
-// Drilldown Modal
 function DrilldownModal({ title, children, onClose, onNavigate, navLabel }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onClose}>
@@ -55,15 +53,36 @@ function DrilldownModal({ title, children, onClose, onNavigate, navLabel }) {
   );
 }
 
+const CustomTooltip = ({ active, payload, label }) => {
+  if (active && payload && payload.length) {
+    return (
+      <div className="bg-white rounded-lg shadow-lg border border-slate-200 p-3 text-sm">
+        <p className="font-semibold text-slate-700 mb-1">{label}</p>
+        {payload.map((p, i) => (
+          <div key={i} className="flex items-center gap-2">
+            <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: p.color }}></div>
+            <span className="text-slate-600">{p.name}:</span>
+            <span className="font-bold text-slate-800">{fmtNum(p.value)}</span>
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return null;
+};
+
 export default function Dashboard({ token, onNavigate }) {
   const [metrics, setMetrics] = useState(null);
+  const [analytics, setAnalytics] = useState(null);
   const [loading, setLoading] = useState(true);
   const [drilldown, setDrilldown] = useState(null);
-  const [dateFilter, setDateFilter] = useState('all');
   const [showReminder, setShowReminder] = useState(false);
   const [reminders, setReminders] = useState([]);
   const [vendors, setVendors] = useState([]);
   const [reminderForm, setReminderForm] = useState({ vendor_id: '', subject: '', message: '', po_number: '', priority: 'normal' });
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  const [showAnalytics, setShowAnalytics] = useState(true);
   const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
 
   const fetchMetrics = useCallback(async () => {
@@ -73,6 +92,18 @@ export default function Dashboard({ token, onNavigate }) {
     } catch (e) { console.error(e); }
     finally { setLoading(false); }
   }, [token]);
+
+  const fetchAnalytics = useCallback(async () => {
+    try {
+      let url = '/api/dashboard/analytics';
+      const params = [];
+      if (dateFrom) params.push(`from=${dateFrom}`);
+      if (dateTo) params.push(`to=${dateTo}`);
+      if (params.length) url += '?' + params.join('&');
+      const res = await fetch(url, { headers });
+      if (res.ok) setAnalytics(await res.json());
+    } catch (e) { console.error(e); }
+  }, [token, dateFrom, dateTo]);
 
   const fetchReminders = useCallback(async () => {
     try {
@@ -88,7 +119,8 @@ export default function Dashboard({ token, onNavigate }) {
     } catch (e) {}
   }, [token]);
 
-  useEffect(() => { fetchMetrics(); fetchReminders(); fetchVendors(); }, []);
+  useEffect(() => { fetchMetrics(); fetchReminders(); fetchVendors(); fetchAnalytics(); }, []);
+  useEffect(() => { fetchAnalytics(); }, [dateFrom, dateTo]);
 
   const nav = (module) => { if (onNavigate) onNavigate(module); };
 
@@ -107,10 +139,16 @@ export default function Dashboard({ token, onNavigate }) {
   const totalAlerts = (metrics?.alerts?.overduePos?.length || 0) + (metrics?.alerts?.nearDeadlinePos?.length || 0) + (metrics?.alerts?.unpaidInvoices?.length || 0);
   const pendingReminders = reminders.filter(r => r.status === 'pending');
   const respondedReminders = reminders.filter(r => r.status === 'responded');
+  const deadlineDist = analytics?.deadlineDistribution || {};
+  const shipStatus = analytics?.shipmentStatus || [];
+  const weeklyTP = analytics?.weeklyThroughput || [];
+  const prodComp = analytics?.productCompletion || [];
+  const vendorLT = analytics?.vendorLeadTimes || [];
+  const defectR = analytics?.defectRates || [];
 
   return (
     <div className="space-y-5" data-testid="dashboard">
-      {/* Header with date filter */}
+      {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold text-slate-800">Dashboard</h1>
@@ -126,7 +164,7 @@ export default function Dashboard({ token, onNavigate }) {
           <button onClick={() => setShowReminder(true)} className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg text-xs font-medium text-blue-700 hover:bg-blue-100" data-testid="send-reminder-btn">
             <Bell className="w-3.5 h-3.5" /> Kirim Reminder
           </button>
-          <button onClick={fetchMetrics} className="p-1.5 hover:bg-slate-100 rounded-lg" title="Refresh">
+          <button onClick={() => { fetchMetrics(); fetchAnalytics(); }} className="p-1.5 hover:bg-slate-100 rounded-lg" title="Refresh">
             <RefreshCw className="w-4 h-4 text-slate-400" />
           </button>
         </div>
@@ -158,26 +196,18 @@ export default function Dashboard({ token, onNavigate }) {
 
       {/* KPI Cards - Row 1 */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-        <KPICard title="Total PO" value={metrics?.totalPOs || 0} subtitle={`${metrics?.activePOs || 0} aktif`} icon={ClipboardList} color="bg-blue-500"
-          onClick={() => setDrilldown('po')} badge={metrics?.delayedPOs > 0 ? { text: `${metrics.delayedPOs} terlambat`, color: 'bg-red-100 text-red-700' } : null} />
-        <KPICard title="Active Jobs" value={metrics?.activeJobs || 0} subtitle="Production jobs berjalan" icon={Factory} color="bg-emerald-500"
-          onClick={() => setDrilldown('jobs')} />
-        <KPICard title="Progress Produksi" value={`${metrics?.globalProgressPct || 0}%`} subtitle={`${fmtNum(metrics?.totalProducedGlobal)} / ${fmtNum(metrics?.totalAvailableGlobal)} pcs`} icon={TrendingUp} color="bg-teal-500"
-          onClick={() => setDrilldown('progress')} />
-        <KPICard title="On-Time Rate" value={`${metrics?.onTimeRate || 0}%`} subtitle="PO selesai tepat waktu" icon={Target} color="bg-indigo-500"
-          onClick={() => setDrilldown('ontime')} />
+        <KPICard title="Total PO" value={metrics?.totalPOs || 0} subtitle={`${metrics?.activePOs || 0} aktif`} icon={ClipboardList} color="bg-blue-500" onClick={() => setDrilldown('po')} badge={metrics?.delayedPOs > 0 ? { text: `${metrics.delayedPOs} terlambat`, color: 'bg-red-100 text-red-700' } : null} />
+        <KPICard title="Active Jobs" value={metrics?.activeJobs || 0} subtitle="Production jobs berjalan" icon={Factory} color="bg-emerald-500" onClick={() => setDrilldown('jobs')} />
+        <KPICard title="Progress Produksi" value={`${metrics?.globalProgressPct || 0}%`} subtitle={`${fmtNum(metrics?.totalProducedGlobal)} / ${fmtNum(metrics?.totalAvailableGlobal)} pcs`} icon={TrendingUp} color="bg-teal-500" onClick={() => setDrilldown('progress')} />
+        <KPICard title="On-Time Rate" value={`${metrics?.onTimeRate || 0}%`} subtitle="PO selesai tepat waktu" icon={Target} color="bg-indigo-500" onClick={() => setDrilldown('ontime')} />
       </div>
 
       {/* KPI Cards - Row 2 */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-        <KPICard title="Pending Shipment" value={metrics?.pendingShipments || 0} subtitle="Material belum diterima" icon={Truck} color="bg-amber-500"
-          onClick={() => nav('vendor-shipments')} />
-        <KPICard title="Req. Tambahan" value={metrics?.pendingAdditionalRequests || 0} subtitle="Menunggu persetujuan" icon={AlertTriangle} color="bg-orange-500"
-          onClick={() => nav('vendor-shipments')} />
-        <KPICard title="Retur Produksi" value={metrics?.pendingReturns || 0} subtitle="Dalam proses" icon={RotateCcw} color="bg-purple-500"
-          onClick={() => nav('production-returns')} />
-        <KPICard title="Reminders" value={pendingReminders.length} subtitle={`${respondedReminders.length} dibalas`} icon={Bell} color="bg-cyan-500"
-          onClick={() => setDrilldown('reminders')} badge={respondedReminders.length > 0 ? { text: `${respondedReminders.length} respon baru`, color: 'bg-emerald-100 text-emerald-700' } : null} />
+        <KPICard title="Pending Shipment" value={metrics?.pendingShipments || 0} subtitle="Material belum diterima" icon={Truck} color="bg-amber-500" onClick={() => nav('vendor-shipments')} />
+        <KPICard title="Req. Tambahan" value={metrics?.pendingAdditionalRequests || 0} subtitle="Menunggu persetujuan" icon={AlertTriangle} color="bg-orange-500" onClick={() => nav('vendor-shipments')} />
+        <KPICard title="Retur Produksi" value={metrics?.pendingReturns || 0} subtitle="Dalam proses" icon={RotateCcw} color="bg-purple-500" onClick={() => nav('production-returns')} />
+        <KPICard title="Reminders" value={pendingReminders.length} subtitle={`${respondedReminders.length} dibalas`} icon={Bell} color="bg-cyan-500" onClick={() => setDrilldown('reminders')} badge={respondedReminders.length > 0 ? { text: `${respondedReminders.length} respon baru`, color: 'bg-emerald-100 text-emerald-700' } : null} />
       </div>
 
       {/* KPI Cards - Row 3: Financial */}
@@ -188,7 +218,147 @@ export default function Dashboard({ token, onNavigate }) {
         <KPICard title="Gross Margin" value={fmt(metrics?.grossMargin)} subtitle={`Revenue: ${fmt(metrics?.totalRevenue)}`} icon={Zap} color="bg-emerald-600" onClick={() => nav('financial-recap')} />
       </div>
 
-      {/* Charts Row */}
+      {/* Analytics Section with Date Filter */}
+      <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+          <div className="flex items-center gap-2">
+            <BarChart3 className="w-5 h-5 text-blue-600" />
+            <h3 className="font-bold text-slate-800">Analitik Lanjutan</h3>
+            <button onClick={() => setShowAnalytics(!showAnalytics)} className="text-xs text-slate-400 hover:text-slate-600">
+              {showAnalytics ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            </button>
+          </div>
+          <div className="flex items-center gap-2" data-testid="date-filter">
+            <Calendar className="w-4 h-4 text-slate-400" />
+            <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)} className="border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs focus:ring-2 focus:ring-blue-500 focus:outline-none" />
+            <span className="text-xs text-slate-400">s/d</span>
+            <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)} className="border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs focus:ring-2 focus:ring-blue-500 focus:outline-none" />
+            {(dateFrom || dateTo) && <button onClick={() => { setDateFrom(''); setDateTo(''); }} className="text-xs text-red-500 hover:text-red-700"><X className="w-3.5 h-3.5" /></button>}
+          </div>
+        </div>
+
+        {showAnalytics && (
+          <div className="space-y-4">
+            {/* Row 1: Weekly Throughput + Deadline Distribution + Shipment Status */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="lg:col-span-2 bg-gradient-to-br from-slate-50 to-blue-50/30 rounded-xl p-4 border border-slate-100">
+                <h4 className="font-semibold text-slate-700 text-sm mb-3">Throughput Produksi Mingguan</h4>
+                <ResponsiveContainer width="100%" height={180}>
+                  <BarChart data={weeklyTP}>
+                    <defs>
+                      <linearGradient id="barGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.9}/>
+                        <stop offset="95%" stopColor="#6366f1" stopOpacity={0.7}/>
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                    <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#64748b' }} />
+                    <YAxis tick={{ fontSize: 10, fill: '#64748b' }} />
+                    <Tooltip content={<CustomTooltip />} />
+                    <Bar dataKey="qty" name="Produksi (pcs)" fill="url(#barGrad)" radius={[6,6,0,0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="bg-gradient-to-br from-slate-50 to-amber-50/30 rounded-xl p-4 border border-slate-100">
+                <h4 className="font-semibold text-slate-700 text-sm mb-3">Distribusi Deadline PO</h4>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="bg-red-50 rounded-lg p-3 text-center border border-red-100">
+                    <p className="text-2xl font-bold text-red-600">{deadlineDist.overdue || 0}</p>
+                    <p className="text-[10px] text-red-500 font-medium mt-0.5">Overdue</p>
+                  </div>
+                  <div className="bg-amber-50 rounded-lg p-3 text-center border border-amber-100">
+                    <p className="text-2xl font-bold text-amber-600">{deadlineDist.thisWeek || 0}</p>
+                    <p className="text-[10px] text-amber-500 font-medium mt-0.5">Minggu Ini</p>
+                  </div>
+                  <div className="bg-blue-50 rounded-lg p-3 text-center border border-blue-100">
+                    <p className="text-2xl font-bold text-blue-600">{deadlineDist.nextWeek || 0}</p>
+                    <p className="text-[10px] text-blue-500 font-medium mt-0.5">Minggu Depan</p>
+                  </div>
+                  <div className="bg-emerald-50 rounded-lg p-3 text-center border border-emerald-100">
+                    <p className="text-2xl font-bold text-emerald-600">{deadlineDist.later || 0}</p>
+                    <p className="text-[10px] text-emerald-500 font-medium mt-0.5">Nanti</p>
+                  </div>
+                </div>
+                {shipStatus.length > 0 && (
+                  <div className="mt-3 pt-3 border-t border-slate-100">
+                    <p className="text-xs font-semibold text-slate-600 mb-1.5">Status Pengiriman</p>
+                    {shipStatus.map((s, i) => (
+                      <div key={s.status} className="flex items-center justify-between text-xs py-0.5">
+                        <div className="flex items-center gap-1.5">
+                          <div className="w-2 h-2 rounded-full" style={{ backgroundColor: COLORS[i % COLORS.length] }}></div>
+                          <span className="text-slate-600">{s.status}</span>
+                        </div>
+                        <span className="font-bold text-slate-700">{s.count}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Row 2: Production Completion + Vendor Lead Time + Defect Rate */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              {/* Product Completion */}
+              <div className="bg-gradient-to-br from-slate-50 to-emerald-50/30 rounded-xl p-4 border border-slate-100">
+                <h4 className="font-semibold text-slate-700 text-sm mb-3">Tingkat Penyelesaian Produk</h4>
+                {prodComp.length > 0 ? (
+                  <div className="space-y-2.5">
+                    {prodComp.slice(0, 6).map((p, i) => (
+                      <div key={i}>
+                        <div className="flex justify-between text-xs mb-0.5">
+                          <span className="text-slate-600 truncate max-w-[140px]">{p.product}</span>
+                          <span className="font-bold text-slate-700">{p.rate}%</span>
+                        </div>
+                        <div className="w-full bg-slate-100 rounded-full h-2">
+                          <div className="h-2 rounded-full transition-all" style={{ width: `${Math.min(100, p.rate)}%`, backgroundColor: p.rate >= 80 ? '#10b981' : p.rate >= 50 ? '#f59e0b' : '#ef4444' }} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : <p className="text-xs text-slate-400 text-center py-6">Belum ada data</p>}
+              </div>
+
+              {/* Vendor Lead Time */}
+              <div className="bg-gradient-to-br from-slate-50 to-purple-50/30 rounded-xl p-4 border border-slate-100">
+                <h4 className="font-semibold text-slate-700 text-sm mb-3">Lead Time Vendor (hari)</h4>
+                {vendorLT.length > 0 ? (
+                  <div className="space-y-2">
+                    {vendorLT.slice(0, 6).map((v, i) => (
+                      <div key={i} className="flex items-center justify-between p-2 bg-white rounded-lg border border-slate-100">
+                        <div>
+                          <span className="text-xs font-medium text-slate-700">{v.vendor}</span>
+                          <span className="text-[10px] text-slate-400 ml-1.5">({v.shipment_count} shipment)</span>
+                        </div>
+                        <span className={`text-sm font-bold ${v.avg_days <= 3 ? 'text-emerald-600' : v.avg_days <= 7 ? 'text-amber-600' : 'text-red-600'}`}>{v.avg_days}d</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : <p className="text-xs text-slate-400 text-center py-6">Belum ada data</p>}
+              </div>
+
+              {/* Defect Rate */}
+              <div className="bg-gradient-to-br from-slate-50 to-rose-50/30 rounded-xl p-4 border border-slate-100">
+                <h4 className="font-semibold text-slate-700 text-sm mb-3">Tingkat Material Missing</h4>
+                {defectR.length > 0 ? (
+                  <div className="space-y-2">
+                    {defectR.slice(0, 6).map((d, i) => (
+                      <div key={i} className="flex items-center justify-between p-2 bg-white rounded-lg border border-slate-100">
+                        <div>
+                          <span className="text-xs font-medium text-slate-700">{d.vendor}</span>
+                          <div className="text-[10px] text-slate-400">Diterima: {fmtNum(d.total_received)} | Missing: {fmtNum(d.total_missing)}</div>
+                        </div>
+                        <span className={`text-sm font-bold ${d.missing_rate <= 2 ? 'text-emerald-600' : d.missing_rate <= 5 ? 'text-amber-600' : 'text-red-600'}`}>{d.missing_rate}%</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : <p className="text-xs text-slate-400 text-center py-6">Belum ada data inspeksi</p>}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Original Charts Row */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="lg:col-span-2 bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
           <h3 className="font-semibold text-slate-700 text-sm mb-3">Tren Produksi 6 Bulan</h3>
@@ -203,7 +373,7 @@ export default function Dashboard({ token, onNavigate }) {
               <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
               <XAxis dataKey="month" tick={{ fontSize: 11, fill: '#64748b' }} />
               <YAxis tick={{ fontSize: 11, fill: '#64748b' }} />
-              <Tooltip />
+              <Tooltip content={<CustomTooltip />} />
               <Legend wrapperStyle={{ fontSize: 11 }} />
               <Bar dataKey="pos" name="PO" fill="#3b82f6" radius={[3,3,0,0]} />
               <Area type="monotone" dataKey="production" name="Produksi" stroke="#10b981" fill="url(#colorProd)" />
@@ -240,7 +410,6 @@ export default function Dashboard({ token, onNavigate }) {
 
       {/* Bottom Row */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Top Garments */}
         <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
           <h3 className="font-semibold text-slate-700 text-sm mb-3">Top Vendor by Produksi</h3>
           {topGarments.length > 0 ? (
@@ -263,7 +432,6 @@ export default function Dashboard({ token, onNavigate }) {
           ) : <div className="flex items-center justify-center h-24 text-slate-400 text-xs">Belum ada data produksi vendor</div>}
         </div>
 
-        {/* PO Status Breakdown */}
         <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
           <h3 className="font-semibold text-slate-700 text-sm mb-3">Status PO</h3>
           <div className="space-y-1.5">
@@ -279,7 +447,6 @@ export default function Dashboard({ token, onNavigate }) {
           </div>
         </div>
 
-        {/* Reminder Status */}
         <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
           <div className="flex items-center justify-between mb-3">
             <h3 className="font-semibold text-slate-700 text-sm">Reminder Vendor</h3>
@@ -337,14 +504,6 @@ export default function Dashboard({ token, onNavigate }) {
                 <div className="bg-teal-600 h-3 rounded-full transition-all" style={{ width: `${metrics?.globalProgressPct || 0}%` }} />
               </div>
             </div>
-            <div className="grid grid-cols-2 gap-2">
-              <div className="bg-blue-50 rounded-lg p-3 text-center">
-                <p className="font-bold text-blue-700">{metrics?.activeJobs || 0}</p><p className="text-xs text-blue-600">Jobs Aktif</p>
-              </div>
-              <div className="bg-amber-50 rounded-lg p-3 text-center">
-                <p className="font-bold text-amber-700">{metrics?.pendingShipments || 0}</p><p className="text-xs text-amber-600">Pending Ship</p>
-              </div>
-            </div>
           </div>
         </DrilldownModal>
       )}
@@ -356,8 +515,7 @@ export default function Dashboard({ token, onNavigate }) {
               <div key={r.id} className={`p-3 rounded-lg border ${r.status === 'responded' ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'}`}>
                 <div className="flex justify-between"><span className="text-sm font-semibold text-slate-700">{r.vendor_name}</span><span className="text-xs text-slate-400">{fmtDate(r.created_at)}</span></div>
                 <p className="text-sm text-slate-600 mt-0.5">{r.subject}</p>
-                <p className="text-xs text-slate-500 mt-0.5">{r.message}</p>
-                {r.response && <div className="mt-2 p-2 bg-white rounded border border-emerald-200"><p className="text-xs text-emerald-700"><strong>Respon vendor:</strong> {r.response}</p><p className="text-[10px] text-slate-400">{fmtDate(r.response_date)} oleh {r.responded_by}</p></div>}
+                {r.response && <div className="mt-2 p-2 bg-white rounded border border-emerald-200"><p className="text-xs text-emerald-700"><strong>Respon vendor:</strong> {r.response}</p></div>}
               </div>
             ))}
           </div>

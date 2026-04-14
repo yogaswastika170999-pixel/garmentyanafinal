@@ -43,16 +43,44 @@ def verify_token(request: Request):
     except Exception:
         return None
 
-def require_auth(request: Request):
+async def require_auth(request: Request):
     user = verify_token(request)
     if not user:
         raise HTTPException(status_code=401, detail='Unauthorized')
+    # Pre-load permissions for custom roles
+    role = user.get('role', '')
+    if role == 'superadmin' or role == 'admin':
+        user['_permissions'] = ['*']
+    elif role == 'vendor':
+        user['_permissions'] = ['dashboard.view', 'shipment.view', 'jobs.view', 'jobs.create', 'progress.view', 'progress.create']
+    elif role == 'buyer':
+        user['_permissions'] = ['dashboard.view', 'po.view', 'shipment.view']
+    else:
+        # Custom role: load from DB
+        db = get_db()
+        custom_role = await db.roles.find_one({'name': role})
+        if custom_role:
+            role_perms = await db.role_permissions.find({'role_id': custom_role['id']}, {'_id': 0}).to_list(None)
+            user['_permissions'] = [rp.get('permission_key') for rp in role_perms]
+        else:
+            user['_permissions'] = []
     return user
 
-def check_role(user: dict, allowed_roles: list) -> bool:
+def check_role(user: dict, allowed_roles: list, perm_key: str = None) -> bool:
     if user.get('role') == 'superadmin':
         return True
-    return user.get('role') in allowed_roles
+    if user.get('role') in allowed_roles:
+        return True
+    # Check custom role permissions loaded by require_auth
+    perms = user.get('_permissions', [])
+    if '*' in perms:
+        return True
+    if perm_key and perm_key in perms:
+        return True
+    # If no specific perm_key provided, check if user has any admin-level permissions
+    if not perm_key and perms:
+        return True
+    return False
 
 async def log_activity(user_id, user_name, action, module, details=''):
     db = get_db()

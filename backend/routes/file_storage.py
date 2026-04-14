@@ -17,7 +17,7 @@ def now(): return datetime.now(timezone.utc)
 @router.post("/upload")
 async def upload_file(request: Request, file: UploadFile = File(...),
                       entity_type: str = Query(''), entity_id: str = Query('')):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     data = await file.read()
     if len(data) > 10 * 1024 * 1024:  # 10MB limit
@@ -78,7 +78,7 @@ async def download_file(path: str, request: Request, auth: str = Query(None)):
 
 @router.delete("/attachments/{att_id}")
 async def delete_attachment(att_id: str, request: Request):
-    user = require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     doc = await db.attachments.find_one({'id': att_id})
     if not doc: raise HTTPException(404, 'Not found')
