@@ -1634,17 +1634,37 @@ function VendorMaterialInspection({ token, user }) {
       missing_qty: 0,
       condition_notes: ''
     }));
-    // Load PO accessories for inspection
-    const accessory_items = (data.po_accessories || []).map(acc => ({
-      accessory_id: acc.accessory_id || acc.id || '',
-      accessory_name: acc.accessory_name || '',
-      accessory_code: acc.accessory_code || '',
-      unit: acc.unit || 'pcs',
-      ordered_qty: acc.qty_needed || 0,
-      received_qty: acc.qty_needed || 0,
-      missing_qty: 0,
-      condition_notes: ''
-    }));
+    
+    // Load accessories for inspection
+    // For additional accessory shipments, use accessory_items from shipment
+    // For normal shipments, use po_accessories from linked PO
+    let accessory_items = [];
+    if (data.accessory_items && data.accessory_items.length > 0) {
+      // This is an additional accessory shipment
+      accessory_items = data.accessory_items.map(asi => ({
+        accessory_id: asi.accessory_id || '',
+        accessory_name: asi.accessory_name || '',
+        accessory_code: asi.accessory_code || '',
+        unit: asi.unit || 'pcs',
+        ordered_qty: asi.qty_sent || 0,
+        received_qty: asi.qty_sent || 0,
+        missing_qty: 0,
+        condition_notes: ''
+      }));
+    } else if (data.po_accessories && data.po_accessories.length > 0) {
+      // Normal shipment with PO accessories
+      accessory_items = data.po_accessories.map(acc => ({
+        accessory_id: acc.accessory_id || acc.id || '',
+        accessory_name: acc.accessory_name || '',
+        accessory_code: acc.accessory_code || '',
+        unit: acc.unit || 'pcs',
+        ordered_qty: acc.qty_needed || 0,
+        received_qty: acc.qty_needed || 0,
+        missing_qty: 0,
+        condition_notes: ''
+      }));
+    }
+    
     setForm({ inspection_date: new Date().toISOString().split('T')[0], overall_notes: '', items, accessory_items });
     setShowModal(true);
   };

@@ -1,6 +1,14 @@
 [
   {
-    "content": "Testing manual untuk verify all fixes",
+    "content": "Fix: Distribusi Kerja & Monitoring Produksi masih menunjukkan Dikirim=0 (frontend field name mismatch)",
     "status": "completed"
+  },
+  {
+    "content": "Implement overproduction/underproduction tracking feature (backend: collection + endpoints)",
+    "status": "in_progress"
+  },
+  {
+    "content": "Implement overproduction/underproduction tracking feature (frontend: Vendor Portal input + Admin ERP monitor)",
+    "status": "pending"
   }
 ]

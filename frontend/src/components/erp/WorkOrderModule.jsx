@@ -193,7 +193,7 @@ export default function WorkOrderModule({ token, userRole }) {
   const totalOrdered  = filteredHierarchy.reduce((s, v) => s + (v.total_ordered || 0), 0);
   const totalReceived = filteredHierarchy.reduce((s, v) => s + (v.total_received || 0), 0);
   const totalProduced = filteredHierarchy.reduce((s, v) => s + (v.total_produced || 0), 0);
-  const totalShipped  = filteredHierarchy.reduce((s, v) => s + (v.total_shipped || 0), 0);
+  const totalShipped  = filteredHierarchy.reduce((s, v) => s + (v.total_shipped_to_buyer || 0), 0);
   const totalMissing  = filteredHierarchy.reduce((s, v) => s + (v.total_missing || 0), 0);
   const globalPct     = totalOrdered > 0 ? Math.round((totalProduced / totalOrdered) * 100) : 0;
 

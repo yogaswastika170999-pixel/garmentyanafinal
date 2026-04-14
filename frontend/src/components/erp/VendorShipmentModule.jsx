@@ -86,6 +86,8 @@ function ShipmentList({ token, userRole }) {
     const [sData, vData, pData] = await Promise.all([sRes.json(), vRes.json(), pRes.json()]);
     setShipments(Array.isArray(sData) ? sData : []);
     setVendors(Array.isArray(vData) ? vData.filter(v => v.status === 'active') : []);
+    // Filter PO yang belum Completed/Closed dan masih punya material untuk dikirim ke vendor (belum fully received)
+    // Note: remaining_qty_to_ship adalah untuk buyer, bukan vendor. Untuk vendor perlu hitung sendiri.
     setPOs(Array.isArray(pData) ? pData.filter(p => !['Completed', 'Closed'].includes(p.status)) : []);
   };
 

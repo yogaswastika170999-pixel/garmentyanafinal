@@ -74,7 +74,7 @@ export default function ProductionMonitoringModule({ token }) {
     totalJobs: filtered.reduce((s, v) => s + (v.total_jobs || 0), 0),
     totalQty: filtered.reduce((s, v) => s + (v.total_qty || 0), 0),
     totalProduced: filtered.reduce((s, v) => s + (v.total_produced || 0), 0),
-    totalShipped: filtered.reduce((s, v) => s + (v.total_shipped || 0), 0),
+    totalShipped: filtered.reduce((s, v) => s + (v.total_shipped_to_buyer || 0), 0),
     overdue: filtered.filter(v => v.performance === 'Overdue').length,
     atRisk: filtered.filter(v => v.performance === 'At Risk').length,
   };
@@ -221,7 +221,7 @@ export default function ProductionMonitoringModule({ token }) {
                     </div>
                     <div className="text-center">
                       <p className="text-xs text-slate-400">Dikirim</p>
-                      <p className="font-bold text-blue-700">{fmtNum(vendor.total_shipped)}</p>
+                      <p className="font-bold text-blue-700">{fmtNum(vendor.total_shipped_to_buyer)}</p>
                     </div>
                     <div className="text-center">
                       <p className="text-xs text-slate-400">Progress</p>
@@ -248,7 +248,7 @@ export default function ProductionMonitoringModule({ token }) {
                       </div>
                       <div className="flex items-center gap-2">
                         <div className="w-2 h-2 rounded-full bg-blue-500"></div>
-                        <span className="text-xs text-slate-600">Total Dikirim: <strong>{fmtNum(vendor.total_shipped)} pcs</strong></span>
+                        <span className="text-xs text-slate-600">Total Dikirim: <strong>{fmtNum(vendor.total_shipped_to_buyer)} pcs</strong></span>
                       </div>
                     </div>
 
