@@ -1,14 +1,14 @@
 [
   {
-    "content": "Fix: Distribusi Kerja & Monitoring Produksi masih menunjukkan Dikirim=0 (frontend field name mismatch)",
+    "content": "Backend: Production variances endpoints (POST, GET, GET /stats, PUT)",
     "status": "completed"
   },
   {
-    "content": "Implement overproduction/underproduction tracking feature (backend: collection + endpoints)",
+    "content": "Frontend: Add Variance Report menu di Vendor Portal dengan form input",
     "status": "in_progress"
   },
   {
-    "content": "Implement overproduction/underproduction tracking feature (frontend: Vendor Portal input + Admin ERP monitor)",
+    "content": "Frontend: Add Overproduction & Underproduction menu di Admin ERP dengan list & filters",
     "status": "pending"
   }
 ]
