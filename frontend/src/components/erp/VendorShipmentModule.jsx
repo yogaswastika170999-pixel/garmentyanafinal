@@ -242,7 +242,7 @@ function ShipmentList({ token, userRole, hasPerm = () => false }) {
         />
         <div className="flex items-center gap-2">
           <ImportExportPanel token={token} importType={null} exportType="vendor-shipments" />
-          {canEdit && (
+          {canCreate && (
             <button onClick={() => { setForm({ shipment_number: '', delivery_note_number: '', vendor_id: '', shipment_date: new Date().toISOString().split('T')[0], notes: '', items: [] }); setSelectedPO(null); setPoItems([]); setPoAccessories([]); setShowModal(true); }}
               className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">
               <Plus className="w-4 h-4" /> Buat Shipment Normal
