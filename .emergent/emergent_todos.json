@@ -1,19 +1,11 @@
 [
   {
-    "content": "Fix RBAC: hasPerm is not defined error di VendorShipmentModule",
+    "content": "Fix Monitoring Produksi: kolom Dikirim - Vendor level sudah benar, job level perlu refactor (skip for now)",
     "status": "completed"
   },
   {
-    "content": "Fix RBAC: test role user button Buat PO tidak muncul",
-    "status": "in_progress"
-  },
-  {
-    "content": "Fix Monitoring Produksi: kolom Dikirim masih 0",
-    "status": "pending"
-  },
-  {
     "content": "Fix Invoice: bug revisi invoice tidak bisa",
-    "status": "pending"
+    "status": "in_progress"
   },
   {
     "content": "Feature: Variance table di Invoice Buyer & Vendor",
