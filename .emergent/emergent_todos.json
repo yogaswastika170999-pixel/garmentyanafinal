@@ -1,6 +1,30 @@
 [
   {
-    "content": "Update plan.md ke status COMPLETED untuk Phase 9 & 10",
-    "status": "completed"
+    "content": "Fix accessory material request & inspection flow - nama aksesoris tidak ditampilkan",
+    "status": "pending"
+  },
+  {
+    "content": "Fix inspection aksesoris - additional shipment seharusnya hanya untuk qty missing, bukan qty penuh",
+    "status": "pending"
+  },
+  {
+    "content": "Fix popup inspeksi - harus tunjukkan missing accessories, bukan 'semua bahan diterima'",
+    "status": "pending"
+  },
+  {
+    "content": "Fix tracking dikirim ke buyer - hitung buyer shipment dispatches di Distribusi Kerja & Monitoring",
+    "status": "pending"
+  },
+  {
+    "content": "Filter PO yang sudah fully shipped di Buyer Shipment creation form (admin ERP)",
+    "status": "pending"
+  },
+  {
+    "content": "Filter job produksi yang sudah fully shipped di Vendor Portal - Pengiriman ke Buyer",
+    "status": "pending"
+  },
+  {
+    "content": "Cek overproduction/underproduction feature - API & FE implementation status",
+    "status": "pending"
   }
 ]
