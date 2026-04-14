@@ -13,7 +13,7 @@ import ImportExportPanel from './ImportExportPanel';
 const STATUS_OPTIONS = ['Draft', 'Confirmed', 'Distributed', 'In Production', 'Completed', 'Closed'];
 const CLOSE_REASONS = ['Under Production', 'Over Production', 'Price Adjustment', 'Customer Agreement', 'Other'];
 
-export default function ProductionPOModule({ token, userRole }) {
+export default function ProductionPOModule({ token, userRole, hasPerm = () => false }) {
   const [pos, setPOs] = useState([]);
   const [products, setProducts] = useState([]);
   const [vendors, setVendors] = useState([]);
@@ -33,7 +33,9 @@ export default function ProductionPOModule({ token, userRole }) {
   const [editForm, setEditForm] = useState({});
 
   const isSuperAdmin = userRole === 'superadmin';
-  const canEdit = ['superadmin', 'admin'].includes(userRole);
+  const canEdit = ['superadmin', 'admin'].includes(userRole) || hasPerm('po.edit');
+  const canCreate = ['superadmin', 'admin'].includes(userRole) || hasPerm('po.create');
+  const canDelete = ['superadmin', 'admin'].includes(userRole) || hasPerm('po.delete');
 
   useEffect(() => { fetchPOs(); fetchProducts(); fetchVendors(); fetchBuyers(); fetchAccessories(); }, []);
 
@@ -251,7 +253,7 @@ export default function ProductionPOModule({ token, userRole }) {
     { key: 'actions', label: 'Aksi', render: (_, row) => (
       <div className="flex items-center gap-1">
         <button onClick={() => openDetail(row)} className="p-1.5 rounded hover:bg-blue-50 text-blue-600" title="Detail"><Eye className="w-4 h-4" /></button>
-        {isSuperAdmin && (
+        {canEdit && (
           <>
             <button onClick={() => openEdit(row)} className="p-1.5 rounded hover:bg-amber-50 text-amber-600" title="Edit"><Pencil className="w-4 h-4" /></button>
             {!['Closed', 'Completed'].includes(row.status) && (
@@ -330,8 +332,8 @@ export default function ProductionPOModule({ token, userRole }) {
               exportFilters={{ status: filterStatus }}
               onImportSuccess={() => fetchPOs()} 
             />
-            {isSuperAdmin && (
-              <button onClick={openCreate} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"><Plus className="w-4 h-4" /> Buat PO</button>
+            {canCreate && (
+              <button onClick={openCreate} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700" data-testid="create-po-btn"><Plus className="w-4 h-4" /> Buat PO</button>
             )}
           </div>
         }

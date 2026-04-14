@@ -15,7 +15,7 @@ const TABS = [
   { id: 'replacement', label: 'Permintaan Pengganti', icon: AlertTriangle },
 ];
 
-export default function VendorShipmentModule({ token, userRole }) {
+export default function VendorShipmentModule({ token, userRole, hasPerm = () => false }) {
   const [activeTab, setActiveTab] = useState('shipments');
 
   return (
@@ -71,7 +71,9 @@ function ShipmentList({ token, userRole }) {
   });
 
   const isSuperAdmin = userRole === 'superadmin';
-  const canEdit = ['superadmin', 'admin'].includes(userRole);
+  const canCreate = ['superadmin', 'admin'].includes(userRole) || hasPerm('shipment.create');
+  const canDelete = ['superadmin', 'admin'].includes(userRole) || hasPerm('shipment.create');
+  const canEdit = ['superadmin', 'admin'].includes(userRole) || hasPerm('shipment.create');
 
   useEffect(() => { fetchAll(); }, []);
 
@@ -304,7 +306,7 @@ function ShipmentList({ token, userRole }) {
                     <div className="flex items-center gap-1">
                       <button onClick={() => openDetail(row)} className="p-1.5 rounded hover:bg-blue-50 text-blue-600" title="Detail"><Eye className="w-4 h-4" /></button>
                       <button onClick={() => downloadDeliveryNote(row)} className="p-1.5 rounded hover:bg-emerald-50 text-emerald-600" title="Download DN"><Download className="w-4 h-4" /></button>
-                      {isSuperAdmin && <button onClick={() => setConfirmDelete(row)} className="p-1.5 rounded hover:bg-red-50 text-red-500"><Trash2 className="w-4 h-4" /></button>}
+                      {canDelete && <button onClick={() => setConfirmDelete(row)} className="p-1.5 rounded hover:bg-red-50 text-red-500"><Trash2 className="w-4 h-4" /></button>}
                     </div>
                   </td>
                 </tr>,

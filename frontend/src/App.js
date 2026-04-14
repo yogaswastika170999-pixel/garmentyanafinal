@@ -152,32 +152,37 @@ function App() {
   }
 
   // MAIN ERP SYSTEM
+  const userPerms = user?.permissions || [];
+  const hasPerm = (key) => {
+    if (user?.role === 'superadmin' || user?.role === 'admin') return true;
+    return userPerms.includes(key);
+  };
   const renderModule = () => {
     switch (currentModule) {
       case 'dashboard': return <Dashboard token={token} onNavigate={handleNavigate} />;
-      case 'garments': return <GarmentsModule token={token} userRole={user?.role} />;
-      case 'buyers': return <BuyersModule token={token} userRole={user?.role} />;
-      case 'products': return <ProductsModule token={token} userRole={user?.role} />;
-      case 'production-po': return <ProductionPOModule token={token} userRole={user?.role} />;
-      case 'vendor-shipments': return <VendorShipmentModule token={token} userRole={user?.role} />;
-      case 'buyer-shipments': return <BuyerShipmentModule token={token} userRole={user?.role} />;
-      case 'work-orders': return <WorkOrderModule token={token} userRole={user?.role} />;
-      case 'production-progress': return <ProductionProgressModule token={token} userRole={user?.role} />;
-      case 'production-monitoring': return <ProductionMonitoringModule token={token} userRole={user?.role} />;
-      case 'production-returns': return <ProductionReturnModule token={token} userRole={user?.role} />;
-      case 'accounts-payable': return <AccountsPayableModule token={token} userRole={user?.role} />;
-      case 'accounts-receivable': return <AccountsReceivableModule token={token} userRole={user?.role} />;
-      case 'manual-invoice': return <ManualInvoiceModule token={token} userRole={user?.role} />;
-      case 'invoices': return <InvoiceModule token={token} userRole={user?.role} onNavigate={handleNavigate} />;
-      case 'payments': return <PaymentModule token={token} userRole={user?.role} prefillInvoice={paymentPrefill} />;
-      case 'financial-recap': return <FinancialRecapModule token={token} userRole={user?.role} />;
-      case 'reports': return <ReportsModule token={token} userRole={user?.role} />;
-      case 'users': return <UserManagementModule token={token} userRole={user?.role} />;
-      case 'activity-logs': return <ActivityLogModule token={token} userRole={user?.role} />;
-      case 'company-settings': return <CompanySettingsModule token={token} userRole={user?.role} />;
+      case 'garments': return <GarmentsModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'buyers': return <BuyersModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'products': return <ProductsModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'production-po': return <ProductionPOModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'vendor-shipments': return <VendorShipmentModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'buyer-shipments': return <BuyerShipmentModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'work-orders': return <WorkOrderModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'production-progress': return <ProductionProgressModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'production-monitoring': return <ProductionMonitoringModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'production-returns': return <ProductionReturnModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'accounts-payable': return <AccountsPayableModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'accounts-receivable': return <AccountsReceivableModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'manual-invoice': return <ManualInvoiceModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'invoices': return <InvoiceModule token={token} userRole={user?.role} onNavigate={handleNavigate} hasPerm={hasPerm} />;
+      case 'payments': return <PaymentModule token={token} userRole={user?.role} prefillInvoice={paymentPrefill} hasPerm={hasPerm} />;
+      case 'financial-recap': return <FinancialRecapModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'reports': return <ReportsModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'users': return <UserManagementModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'activity-logs': return <ActivityLogModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'company-settings': return <CompanySettingsModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
       case 'serial-tracking': return <SerialTrackingModule token={token} />;
-      case 'accessories': return <AccessoryModule token={token} userRole={user?.role} />;
-      case 'role-management': return <RoleManagementModule token={token} userRole={user?.role} />;
+      case 'accessories': return <AccessoryModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'role-management': return <RoleManagementModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
       case 'pdf-config': return <PDFConfigModule token={token} />;
       case 'help-guide': return <HelpGuideModule />;
       default: return <Dashboard token={token} userRole={user?.role} />;

@@ -1,30 +1,26 @@
 [
   {
-    "content": "Phase 3: RBAC bug fix - Custom role permissions not working for PO/shipment creation",
+    "content": "Perbaiki syntax error di ProductionPOModule.jsx (missing Fragment <>)",
     "status": "completed"
   },
   {
-    "content": "Phase 4: Accessories in material inspection + additional shipment requests with accessories",
+    "content": "Verifikasi frontend bisa compile tanpa error",
     "status": "completed"
   },
   {
-    "content": "Phase 5: Vendor inspection PDF export (materials + accessories + PO info)",
-    "status": "completed"
+    "content": "Panggil Testing Agent untuk comprehensive testing (RBAC, auto-material request, thumbnails, PDF per-dispatch)",
+    "status": "pending"
   },
   {
-    "content": "Phase 6: Product photos - upload in master data + display in downstream views",
-    "status": "completed"
+    "content": "Fix semua bugs yang dilaporkan Testing Agent (jika ada)",
+    "status": "pending"
   },
   {
-    "content": "Phase 7: Dashboard UI/UX - modern analytics visualizations + date range filter",
-    "status": "completed"
+    "content": "Buat file DESIGN_TECHNICAL_DOCUMENT.md dengan dokumentasi lengkap fitur-fitur baru",
+    "status": "pending"
   },
   {
-    "content": "Phase 8: Serial Tracking - expandable serial list in ERP + vendor portal",
-    "status": "completed"
-  },
-  {
-    "content": "Phase 9: Regression testing for all new features",
-    "status": "completed"
+    "content": "Update plan.md ke status COMPLETED untuk Phase 9",
+    "status": "pending"
   }
 ]

@@ -478,6 +478,7 @@ async def get_po(po_id: str, request: Request):
     items = await db.po_items.find({'po_id': po_id}, {'_id': 0}).to_list(None)
     wos = await db.work_orders.find({'po_id': po_id}, {'_id': 0}).to_list(None)
     po_accessories = await db.po_accessories.find({'po_id': po_id}, {'_id': 0}).sort('created_at', 1).to_list(None)
+    items = await enrich_with_product_photos(items, db)
     result = serialize_doc(po)
     result['items'] = serialize_doc(items)
     result['distributions'] = serialize_doc(wos)
@@ -695,6 +696,7 @@ async def get_vendor_shipment(sid: str, request: Request):
             acc['po_number'] = po_number
             po_accessories_all.append(acc)
         po_info_map[pid] = po_number
+    items = await enrich_with_product_photos(items, db)
     result = serialize_doc(s)
     result['items'] = serialize_doc(items)
     result['child_shipments'] = child_with_items
@@ -937,6 +939,34 @@ async def create_inspection(request: Request):
                     'ordered_qty': si.get('qty_sent', 0), 'shipment_qty': si.get('qty_sent', 0),
                     'available_qty': avail, 'produced_qty': 0, 'created_at': now()
                 })
+    # Auto-create material request for missing accessories
+    missing_accessories = [a for a in accessory_items_data if int(a.get('missing_qty', 0) or 0) > 0]
+    if missing_accessories:
+        po_id = shipment.get('po_id', '')
+        if not po_id:
+            first_si = await db.vendor_shipment_items.find_one({'shipment_id': body['shipment_id']})
+            if first_si: po_id = first_si.get('po_id', '')
+        if po_id:
+            po_doc = await db.production_pos.find_one({'id': po_id}, {'_id': 0})
+            po_number = (po_doc or {}).get('po_number', '')
+            req_count = await db.material_requests.count_documents({'po_id': po_id, 'request_type': 'ADDITIONAL'})
+            req_number = f"REQ-ACC-{req_count + 1}-{po_number}"
+            acc_details = ', '.join([f"{a.get('accessory_name', '')}({a.get('missing_qty', 0)} {a.get('unit', 'pcs')})" for a in missing_accessories])
+            req_doc = {
+                'id': new_id(), 'request_number': req_number,
+                'po_id': po_id, 'po_number': po_number,
+                'vendor_id': vendor_id, 'vendor_name': shipment.get('vendor_name', ''),
+                'request_type': 'ADDITIONAL', 'category': 'accessories',
+                'shipment_id': body.get('shipment_id'),
+                'reason': f"Aksesoris kurang saat inspeksi: {acc_details}",
+                'notes_for_vendor': '',
+                'status': 'Pending',
+                'items': [{'accessory_name': a.get('accessory_name', ''), 'accessory_code': a.get('accessory_code', ''),
+                           'missing_qty': int(a.get('missing_qty', 0)), 'unit': a.get('unit', 'pcs')} for a in missing_accessories],
+                'created_by': user['name'], 'created_at': now(), 'updated_at': now()
+            }
+            await db.material_requests.insert_one(req_doc)
+
     await log_activity(user['id'], user['name'], 'Create', 'Material Inspection',
                        f"Inspeksi shipment {shipment.get('shipment_number')}: diterima {total_received}, missing {total_missing}, acc diterima {total_acc_received}, acc missing {total_acc_missing}")
     all_item_docs = await db.vendor_material_inspection_items.find({'inspection_id': inspection_id}, {'_id': 0}).to_list(None)
@@ -1279,7 +1309,8 @@ async def create_buyer_shipment(request: Request):
     if is_new:
         shipment_id = new_id()
         master_shipment = {
-            'id': shipment_id, 'shipment_number': body.get('shipment_number', f"BS-{int(datetime.now().timestamp())}"),
+            'id': shipment_id,
+            'shipment_number': body.get('shipment_number') or f"SJ-BYR-{(po or {}).get('po_number', '') or int(datetime.now().timestamp())}",
             'vendor_id': vendor_id, 'vendor_name': (vendor_doc or {}).get('garment_name', user['name']),
             'po_id': body.get('po_id'), 'po_number': (po or {}).get('po_number', body.get('po_number', '')),
             'customer_name': (po or {}).get('customer_name', body.get('customer_name', '')),
@@ -3035,6 +3066,19 @@ def _pdf_footer(elements):
 def _safe_str(v, max_len=40):
     s = str(v or '')
     return s[:max_len] if len(s) > max_len else s
+
+async def enrich_with_product_photos(items, db):
+    """Add product photo_url to items that have a product_name."""
+    if not items: return items
+    product_cache = {}
+    for item in items:
+        pname = item.get('product_name', '')
+        if pname and pname not in product_cache:
+            prod = await db.products.find_one({'product_name': pname}, {'_id': 0, 'photo_url': 1})
+            product_cache[pname] = (prod or {}).get('photo_url', '')
+        if pname:
+            item['product_photo'] = product_cache.get(pname, '')
+    return items
 
 def _fmt_date(v):
     if not v: return '-'

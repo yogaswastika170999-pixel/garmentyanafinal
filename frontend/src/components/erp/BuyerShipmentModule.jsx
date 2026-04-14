@@ -8,7 +8,7 @@ import ConfirmDialog from './ConfirmDialog';
 import FileAttachmentPanel from './FileAttachmentPanel';
 import ImportExportPanel from './ImportExportPanel';
 
-export default function BuyerShipmentModule({ token, userRole }) {
+export default function BuyerShipmentModule({ token, userRole, hasPerm = () => false }) {
   const [shipments, setShipments] = useState([]);
   const [pos, setPOs] = useState([]);
   const [poItems, setPoItems] = useState([]);
@@ -27,7 +27,8 @@ export default function BuyerShipmentModule({ token, userRole }) {
   });
 
   const isSuperAdmin = userRole === 'superadmin';
-  const canEdit = ['superadmin', 'admin'].includes(userRole);
+  const canCreate = ['superadmin', 'admin'].includes(userRole) || hasPerm('shipment.create');
+  const canEdit = ['superadmin', 'admin'].includes(userRole) || hasPerm('shipment.create');
 
   useEffect(() => { fetchAll(); }, []);
 
@@ -182,7 +183,7 @@ export default function BuyerShipmentModule({ token, userRole }) {
         <button onClick={() => downloadPDF(row)} className="p-1.5 rounded hover:bg-emerald-50 text-emerald-600" title="Download PDF">
           <Download className="w-4 h-4" />
         </button>
-        {isSuperAdmin && (
+        {canCreate && (
           <button onClick={() => setConfirmDelete(row)} className="p-1.5 rounded hover:bg-red-50 text-red-500" title="Hapus">
             <Trash2 className="w-4 h-4" />
           </button>
@@ -442,10 +443,28 @@ export default function BuyerShipmentModule({ token, userRole }) {
             {/* Dispatch History */}
             {(detailData.dispatches || []).length > 0 && (
               <div>
-                <h4 className="font-semibold text-slate-700 mb-2 flex items-center gap-2">
-                  <History className="w-4 h-4 text-blue-500" />
-                  Riwayat Dispatch ({detailData.dispatches.length} round)
-                </h4>
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="font-semibold text-slate-700 flex items-center gap-2">
+                    <History className="w-4 h-4 text-blue-500" />
+                    Riwayat Dispatch ({detailData.dispatches.length} round)
+                  </h4>
+                  {/* Cumulative PDF Export (total, not per dispatch) */}
+                  <button onClick={async () => {
+                    try {
+                      const res = await fetch(`/api/export-pdf?type=buyer-shipment&id=${detailData.id}`, { headers: { Authorization: `Bearer ${token}` } });
+                      if (!res.ok) throw new Error('Export gagal');
+                      const blob = await res.blob();
+                      const url = window.URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `${detailData.shipment_number || 'Buyer-Shipment'}-Total.pdf`;
+                      a.click();
+                      window.URL.revokeObjectURL(url);
+                    } catch (err) { alert('Error: ' + err.message); }
+                  }} className="px-3 py-1.5 bg-blue-600 text-white text-xs rounded-lg font-medium hover:bg-blue-700 flex items-center gap-1" data-testid="export-cumulative-pdf">
+                    PDF Total Kumulatif
+                  </button>
+                </div>
                 <div className="space-y-2">
                   {(() => {
                     let cumulative = 0;
@@ -462,10 +481,27 @@ export default function BuyerShipmentModule({ token, userRole }) {
                               <span className="text-sm font-semibold text-slate-700">Dispatch #{d.dispatch_seq}</span>
                               <span className="text-xs text-slate-400">· {fmtDate(d.dispatch_date)}</span>
                             </div>
-                            <div className="flex items-center gap-4 text-xs">
+                            <div className="flex items-center gap-3 text-xs">
                               <span className="text-emerald-700 font-bold">+{fmtNum(d.total_qty)} pcs</span>
                               <span className="text-blue-700">Kumulatif: {fmtNum(cumulative)}</span>
                               <span className="text-slate-500">Sisa: {fmtNum(remaining)}</span>
+                              {/* Per-dispatch PDF button */}
+                              <button onClick={async (e) => {
+                                e.stopPropagation();
+                                try {
+                                  const res = await fetch(`/api/export-pdf?type=buyer-shipment-dispatch&id=${detailData.id}&dispatch=${d.dispatch_seq}`, { headers: { Authorization: `Bearer ${token}` } });
+                                  if (!res.ok) throw new Error('Export gagal');
+                                  const blob = await res.blob();
+                                  const url = window.URL.createObjectURL(blob);
+                                  const a = document.createElement('a');
+                                  a.href = url;
+                                  a.download = `${detailData.shipment_number || 'Dispatch'}-D${d.dispatch_seq}.pdf`;
+                                  a.click();
+                                  window.URL.revokeObjectURL(url);
+                                } catch (err) { alert('Error: ' + err.message); }
+                              }} className="px-2 py-1 bg-white border border-blue-300 text-blue-600 rounded text-[10px] font-medium hover:bg-blue-50 flex items-center gap-1" data-testid={`export-dispatch-${d.dispatch_seq}-pdf`}>
+                                PDF D{d.dispatch_seq}
+                              </button>
                             </div>
                           </div>
                           <table className="w-full text-xs">

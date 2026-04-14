@@ -86,22 +86,6 @@ export default function Login({ onLogin }) {
               )}
             </button>
           </form>
-
-          <div className="mt-6 pt-5 border-t border-slate-100">
-            <p className="text-xs text-slate-400 text-center mb-3">Akun Demo:</p>
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <div className="bg-slate-50 rounded-lg p-2">
-                <p className="font-semibold text-slate-600">ERP Admin</p>
-                <p className="text-slate-400">admin@garment.com</p>
-                <p className="text-slate-400">Admin@123</p>
-              </div>
-              <div className="bg-emerald-50 rounded-lg p-2">
-                <p className="font-semibold text-emerald-600">Vendor Portal</p>
-                <p className="text-slate-400">vendor.xxx@garment.com</p>
-                <p className="text-slate-400">(auto-generated)</p>
-              </div>
-            </div>
-          </div>
         </div>
       </div>
     </div>

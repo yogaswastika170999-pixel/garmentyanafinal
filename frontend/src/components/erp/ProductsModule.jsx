@@ -6,7 +6,7 @@ import StatusBadge from './StatusBadge';
 import ConfirmDialog from './ConfirmDialog';
 import ImportExportPanel from './ImportExportPanel';
 
-export default function ProductsModule({ token, userRole }) {
+export default function ProductsModule({ token, userRole, hasPerm = () => false }) {
   const [products, setProducts] = useState([]);
   const [showModal, setShowModal] = useState(false);
   const [showVariantModal, setShowVariantModal] = useState(false);
@@ -21,8 +21,8 @@ export default function ProductsModule({ token, userRole }) {
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef(null);
 
-  const isSuperAdmin = userRole === 'superadmin';
-  const canEdit = ['superadmin', 'admin'].includes(userRole);
+  const isSuperAdmin = userRole === 'superadmin' || hasPerm('products.create');
+  const canEdit = ['superadmin', 'admin'].includes(userRole) || hasPerm('products.edit');
 
   useEffect(() => { fetchProducts(); }, []);
 
