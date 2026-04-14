@@ -122,11 +122,33 @@ async def login(request: Request):
         raise HTTPException(401, 'Email atau password salah')
     if u.get('status') != 'active':
         raise HTTPException(403, 'Akun tidak aktif')
+    
+    # Get user permissions for immediate use (without /auth/me call)
+    user_perms = []
+    role = u.get('role', '')
+    if role == 'superadmin':
+        user_perms = ['*']
+    elif role == 'vendor':
+        user_perms = ['dashboard.view', 'shipment.view', 'jobs.view', 'jobs.create', 'progress.view', 'progress.create']
+    elif role == 'buyer':
+        user_perms = ['dashboard.view', 'po.view', 'shipment.view']
+    else:
+        # Check custom role
+        if u.get('role_id'):
+            role_perms = await db.role_permissions.find({'role_id': u['role_id']}, {'_id': 0}).to_list(None)
+            user_perms = [rp.get('permission_key') for rp in role_perms]
+        else:
+            custom_role = await db.roles.find_one({'name': role})
+            if custom_role:
+                role_perms = await db.role_permissions.find({'role_id': custom_role['id']}, {'_id': 0}).to_list(None)
+                user_perms = [rp.get('permission_key') for rp in role_perms]
+    
     token = create_token(u)
     await log_activity(u['id'], u['name'], 'Login', 'Auth', f"User {u['email']} logged in")
     return {'token': token, 'user': {'id': u['id'], 'name': u['name'], 'email': u['email'], 'role': u['role'],
             'vendor_id': u.get('vendor_id'), 'buyer_id': u.get('buyer_id'),
-            'customer_name': u.get('customer_name', u.get('buyer_company', ''))}}
+            'customer_name': u.get('customer_name', u.get('buyer_company', '')),
+            'permissions': user_perms}}
 
 @api.get("/auth/me")
 async def auth_me(request: Request):
