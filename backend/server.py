@@ -1509,9 +1509,20 @@ async def create_invoice(request: Request):
     if not po: raise HTTPException(404, 'PO tidak ditemukan')
     category = body.get('invoice_category')
     if category not in ['VENDOR', 'BUYER']: raise HTTPException(400, 'invoice_category harus VENDOR atau BUYER')
-    inv_seq = (await db.invoices.count_documents({})) + 1
-    prefix = 'MVINV' if category == 'VENDOR' else 'MBINV'
-    inv_number = f"{prefix}{str(inv_seq).zfill(5)}"
+    
+    # Generate invoice number with PO number
+    po_number = po.get('po_number', 'UNKNOWN')
+    revision = body.get('revision_number', 0) or 0
+    prefix = 'INV-VND' if category == 'VENDOR' else 'INV-BYR'
+    inv_number = f"{prefix}-{po_number}-R{revision}"
+    
+    # Check if invoice number already exists (should be unique)
+    existing = await db.invoices.find_one({'invoice_number': inv_number})
+    if existing:
+        # Increment revision if duplicate
+        revision += 1
+        inv_number = f"{prefix}-{po_number}-R{revision}"
+    
     items = body.get('invoice_items', [])
     recalc_items = []
     for it in items:
@@ -1529,7 +1540,7 @@ async def create_invoice(request: Request):
         'customer_name': po.get('customer_name', ''),
         'invoice_items': recalc_items, 'total_amount': total_amount,
         'paid_amount': 0, 'total_paid': 0, 'remaining_balance': total_amount,
-        'status': 'Unpaid', 'revision_number': 0,
+        'status': 'Unpaid', 'revision_number': revision,
         'discount': float(body.get('discount', 0) or 0), 'notes': body.get('notes', ''),
         'created_by': user['name'], 'created_at': now(), 'updated_at': now()
     }
@@ -1742,6 +1753,7 @@ async def get_activity_logs(request: Request):
     sp = request.query_params
     query = {}
     if sp.get('module'): query['module'] = sp['module']
+    if sp.get('user_id'): query['user_id'] = sp['user_id']  # NEW: filter by user
     limit = int(sp.get('limit', '100'))
     return serialize_doc(await db.activity_logs.find(query, {'_id': 0}).sort('timestamp', -1).limit(limit).to_list(None))
 

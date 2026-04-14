@@ -443,6 +443,65 @@ export default function ManualInvoiceModule({ token, userRole }) {
               </div>
             )}
 
+            {/* Variance Warning - Show if PO has approved variances */}
+            {variances.length > 0 && (
+              <div className="mt-4 p-4 bg-amber-50 border-2 border-amber-300 rounded-lg">
+                <div className="flex items-start gap-2 mb-3">
+                  <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <h4 className="font-semibold text-amber-900 text-sm">Production Variance Terdeteksi</h4>
+                    <p className="text-xs text-amber-700 mt-1">
+                      PO ini memiliki {variances.length} variance produksi yang sudah di-acknowledge. 
+                      Silakan sesuaikan qty invoice secara manual jika diperlukan berdasarkan informasi di bawah.
+                    </p>
+                  </div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm border-collapse">
+                    <thead>
+                      <tr className="bg-amber-100 border-b border-amber-300">
+                        <th className="px-3 py-2 text-left text-xs font-semibold text-amber-900">Job Number</th>
+                        <th className="px-3 py-2 text-left text-xs font-semibold text-amber-900">Type</th>
+                        <th className="px-3 py-2 text-right text-xs font-semibold text-amber-900">Total Variance</th>
+                        <th className="px-3 py-2 text-left text-xs font-semibold text-amber-900">Alasan</th>
+                        <th className="px-3 py-2 text-left text-xs font-semibold text-amber-900">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-amber-200">
+                      {variances.map(v => (
+                        <tr key={v.id} className="hover:bg-amber-100/50">
+                          <td className="px-3 py-2 text-xs font-medium text-slate-700">{v.job_number}</td>
+                          <td className="px-3 py-2">
+                            {v.variance_type === 'OVERPRODUCTION' ? (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-orange-100 text-orange-700">
+                                <ArrowUpCircle className="w-3 h-3" /> Over (+)
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-700">
+                                <ArrowDownCircle className="w-3 h-3" /> Under (-)
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-3 py-2 text-right">
+                            <span className="font-bold text-slate-800">{v.total_variance_qty.toLocaleString('id-ID')}</span>
+                            <span className="text-xs text-slate-500 ml-1">pcs</span>
+                          </td>
+                          <td className="px-3 py-2 text-xs text-slate-600 max-w-xs">
+                            <div className="truncate" title={v.reason}>{v.reason}</div>
+                          </td>
+                          <td className="px-3 py-2">
+                            <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-700">
+                              {v.status}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">Diskon (Rp)</label>

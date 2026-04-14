@@ -1,22 +1,10 @@
 [
   {
-    "content": "Fix Invoice: bug revisi invoice tidak bisa - Added error handling & RBAC support",
+    "content": "Activity Log filter by user - Backend & Frontend",
     "status": "completed"
   },
   {
-    "content": "Feature: Variance table di Invoice Buyer & Vendor",
-    "status": "in_progress"
-  },
-  {
-    "content": "Feature: Invoice Edit Approval System (backend + frontend)",
-    "status": "pending"
-  },
-  {
-    "content": "Feature: Update invoice/shipment numbering dengan PO number",
-    "status": "pending"
-  },
-  {
-    "content": "Feature: Activity Log filter by user",
+    "content": "Invoice Edit Approval System (backend + frontend) - FINAL MAJOR FEATURE",
     "status": "pending"
   }
 ]

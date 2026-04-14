@@ -24,23 +24,34 @@ const MODULE_ICONS = {
 
 export default function ActivityLogModule({ token }) {
   const [logs, setLogs] = useState([]);
+  const [users, setUsers] = useState([]);  // NEW: user list for filter
   const [loading, setLoading] = useState(true);
   const [filterModule, setFilterModule] = useState('');
+  const [filterUser, setFilterUser] = useState('');  // NEW: user filter
 
   const modules = [...new Set(logs.map(l => l.module))];
 
-  useEffect(() => { fetchLogs(); }, []);
+  useEffect(() => { fetchLogs(); fetchUsers(); }, []);
 
   const fetchLogs = async () => {
     setLoading(true);
-    const url = filterModule ? `/api/activity-logs?module=${filterModule}&limit=200` : '/api/activity-logs?limit=200';
+    const params = new URLSearchParams({ limit: '200' });
+    if (filterModule) params.append('module', filterModule);
+    if (filterUser) params.append('user_id', filterUser);
+    const url = `/api/activity-logs?${params}`;
     const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
     const data = await res.json();
     setLogs(Array.isArray(data) ? data : []);
     setLoading(false);
   };
 
-  const filtered = filterModule ? logs.filter(l => l.module === filterModule) : logs;
+  const fetchUsers = async () => {
+    const res = await fetch('/api/users', { headers: { Authorization: `Bearer ${token}` } });
+    const data = await res.json();
+    setUsers(Array.isArray(data) ? data : []);
+  };
+
+  const filtered = logs;  // Filtering already done server-side
 
   const formatDateTime = (d) => {
     if (!d) return '-';
@@ -76,6 +87,22 @@ export default function ActivityLogModule({ token }) {
           </button>
         ))}
       </div>
+
+      {/* User Filter */}
+      <div className="bg-white p-3 rounded-lg border border-slate-200">
+        <div className="flex items-center gap-3">
+          <label className="text-sm font-medium text-slate-700 whitespace-nowrap">Filter User:</label>
+          <select value={filterUser} onChange={(e) => { setFilterUser(e.target.value); }}
+            className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm">
+            <option value="">Semua User</option>
+            {users.map(u => <option key={u.id} value={u.id}>{u.name} - {u.email}</option>)}
+          </select>
+          <button onClick={fetchLogs} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 whitespace-nowrap">
+            Terapkan Filter
+          </button>
+        </div>
+      </div>
+
 
       {/* Stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
