@@ -462,8 +462,19 @@ async def get_pos(request: Request):
                 date_str = str(created)[:10]
         composite_label = f"{po.get('po_number', '')} | {po.get('vendor_name', '')} | {date_str}"
         po_accessories = await db.po_accessories.find({'po_id': po['id']}, {'_id': 0}).to_list(None)
+        
+        # Calculate remaining qty to ship to buyer (total_ordered - total_shipped_to_buyer)
+        total_ordered = sum(i.get('qty', 0) for i in items)
+        total_shipped = 0
+        for item in items:
+            buyer_items = await db.buyer_shipment_items.find({'po_item_id': item['id']}).to_list(None)
+            total_shipped += sum(bi.get('qty_shipped', 0) for bi in buyer_items)
+        remaining_qty_to_ship = total_ordered - total_shipped
+        
         result.append({**serialize_doc(po), 'items': serialize_doc(items), 'item_count': len(items),
-                       'total_qty': sum(i.get('qty', 0) for i in items),
+                       'total_qty': total_ordered,
+                       'total_shipped_to_buyer': total_shipped,
+                       'remaining_qty_to_ship': remaining_qty_to_ship,
                        'serial_numbers': serial_numbers, 'composite_label': composite_label,
                        'po_accessories': serialize_doc(po_accessories),
                        'po_accessories_count': len(po_accessories)})
@@ -1011,10 +1022,26 @@ async def get_jobs(request: Request):
             ci = await db.production_job_items.find({'job_id': child['id']}).to_list(None)
             total_available += sum(i.get('available_qty', i.get('shipment_qty', 0)) for i in ci)
             total_produced += sum(i.get('produced_qty', 0) for i in ci)
+        
+        # Calculate total shipped to buyer for this job (sum from buyer_shipment_items linked to job_items)
+        total_shipped_to_buyer = 0
+        all_job_item_ids = [i['id'] for i in items]
+        for child in child_jobs:
+            ci = await db.production_job_items.find({'job_id': child['id']}).to_list(None)
+            all_job_item_ids.extend([ci_item['id'] for ci_item in ci])
+        
+        # Get buyer shipment items by job_id (direct link)
+        buyer_items_by_job = await db.buyer_shipment_items.find({'job_id': j['id']}).to_list(None)
+        total_shipped_to_buyer = sum(bi.get('qty_shipped', 0) for bi in buyer_items_by_job)
+        
+        # Remaining to ship = total_produced - total_shipped_to_buyer
+        remaining_to_ship = total_produced - total_shipped_to_buyer
+        
         serial_numbers = list(set(i.get('serial_number', '') for i in items if i.get('serial_number')))
         result.append({**serialize_doc(j), 'item_count': len(items),
                        'total_ordered': total_ordered, 'total_available': total_available,
-                       'total_produced': total_produced,
+                       'total_produced': total_produced, 'total_shipped_to_buyer': total_shipped_to_buyer,
+                       'remaining_to_ship': remaining_to_ship,
                        'progress_pct': round((total_produced / total_available * 100) if total_available > 0 else 0),
                        'serial_numbers': serial_numbers, 'child_job_count': len(child_jobs),
                        'child_jobs': [{'id': c['id'], 'job_number': c.get('job_number'), 'status': c.get('status'), 'shipment_type': c.get('shipment_type')} for c in child_jobs]})
@@ -2573,15 +2600,22 @@ async def production_monitoring(request: Request):
                     cji = await db.production_job_items.find_one({'job_id': cj['id'], 'po_item_id': item.get('po_item_id')}) if item.get('po_item_id') else None
                     if cji: child_produced += cji.get('produced_qty', 0)
                 total_prod = (item.get('produced_qty', 0)) + child_produced
-                all_job_items.append({**item, 'total_produced_qty': total_prod, 'job': job})
+                # Get shipped to buyer for this item
+                shipped_to_buyer = 0
+                if item.get('po_item_id'):
+                    buyer_items = await db.buyer_shipment_items.find({'po_item_id': item['po_item_id']}).to_list(None)
+                    shipped_to_buyer = sum(bi.get('qty_shipped', 0) for bi in buyer_items)
+                all_job_items.append({**item, 'total_produced_qty': total_prod, 'shipped_to_buyer_qty': shipped_to_buyer, 'job': job})
         total_qty = sum(i.get('ordered_qty', 0) for i in all_job_items)
         total_produced = sum(i.get('total_produced_qty', 0) for i in all_job_items)
+        total_shipped_to_buyer = sum(i.get('shipped_to_buyer_qty', 0) for i in all_job_items)
         pct = round((total_produced / total_qty * 100) if total_qty > 0 else 0)
         result.append({
             'vendor_id': g['id'], 'vendor_name': g.get('garment_name'),
             'vendor_code': g.get('garment_code'), 'location': g.get('location', ''),
             'total_jobs': len(parent_jobs), 'total_qty': total_qty,
-            'total_produced': total_produced, 'progress_pct': pct,
+            'total_produced': total_produced, 'total_shipped_to_buyer': total_shipped_to_buyer,
+            'progress_pct': pct,
             'jobs_by_status': {
                 'in_progress': len([j for j in parent_jobs if j.get('status') == 'In Progress']),
                 'completed': len([j for j in parent_jobs if j.get('status') == 'Completed'])

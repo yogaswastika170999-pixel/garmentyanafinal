@@ -42,7 +42,11 @@ export default function BuyerShipmentModule({ token, userRole, hasPerm = () => f
     setShipments(Array.isArray(sData) ? sData : []);
     const allPOsRes = await fetch('/api/production-pos', { headers: { Authorization: `Bearer ${token}` } });
     const allPOs = await allPOsRes.json();
-    setPOs(Array.isArray(allPOs) ? allPOs.filter(p => ['In Production', 'Completed', 'Distributed'].includes(p.status)) : []);
+    // Filter PO yang masih punya sisa untuk dikirim (remaining_qty_to_ship > 0)
+    setPOs(Array.isArray(allPOs) ? allPOs.filter(p => 
+      ['In Production', 'Completed', 'Distributed'].includes(p.status) && 
+      (p.remaining_qty_to_ship || p.total_qty) > 0
+    ) : []);
     setLoading(false);
   };
 

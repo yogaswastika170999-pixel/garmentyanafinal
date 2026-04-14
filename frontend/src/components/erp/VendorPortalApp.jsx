@@ -1453,12 +1453,11 @@ function VendorBuyerShipments({ token, user }) {
                   {/* Jobs with available qty to ship — shown by default */}
                   {(() => {
                     const q = searchJob.toLowerCase();
-                    // Fully shipped jobs = jobs with buyer_shipment ship_status = 'Fully Shipped'
-                    const fullyShippedJobIds = new Set(shipments.filter(s => s.ship_status === 'Fully Shipped').map(s => s.job_id));
+                    // Filter jobs yang masih punya remaining to ship
                     const available = jobs.filter(j => {
-                      const hasAvail = !fullyShippedJobIds.has(j.id) && (j.total_produced || 0) > 0;
+                      const hasRemaining = (j.remaining_to_ship || 0) > 0;
                       const matchSearch = !q || j.job_number?.toLowerCase().includes(q) || j.po_number?.toLowerCase().includes(q);
-                      return hasAvail && matchSearch;
+                      return hasRemaining && matchSearch;
                     });
                     const notStarted = jobs.filter(j => {
                       const noProduced = (j.total_produced || 0) === 0;
@@ -1466,7 +1465,7 @@ function VendorBuyerShipments({ token, user }) {
                       return noProduced && matchSearch && (showAllJobs || q);
                     });
                     const completed = jobs.filter(j => {
-                      const fullyShipped = fullyShippedJobIds.has(j.id);
+                      const fullyShipped = (j.remaining_to_ship || 0) <= 0 && (j.total_produced || 0) > 0;
                       const matchSearch = !q || j.job_number?.toLowerCase().includes(q) || j.po_number?.toLowerCase().includes(q);
                       return fullyShipped && matchSearch && (showAllJobs || q);
                     });
@@ -1683,10 +1682,18 @@ function VendorMaterialInspection({ token, user }) {
       fetchShipments();
       fetchInspections();
 
-      // If there are missing items, auto-prompt to create Additional Request
-      const totalMissing = form.items.reduce((s, i) => s + (i.missing_qty || 0), 0);
+      // If there are missing items (materials OR accessories), auto-prompt to create Additional Request
+      const totalMissingMaterial = form.items.reduce((s, i) => s + (i.missing_qty || 0), 0);
+      const totalMissingAccessory = (form.accessory_items || []).reduce((s, a) => s + (a.missing_qty || 0), 0);
+      const totalMissing = totalMissingMaterial + totalMissingAccessory;
+      
       if (totalMissing > 0) {
-        const confirm = window.confirm(`Inspeksi berhasil disimpan!\n\nTerdeteksi ${totalMissing} pcs material MISSING.\nApakah Anda ingin langsung mengajukan Permintaan Material Tambahan kepada ERP?`);
+        let missingMsg = `Inspeksi berhasil disimpan!\n\n`;
+        if (totalMissingMaterial > 0) missingMsg += `Terdeteksi ${totalMissingMaterial} pcs material MISSING.\n`;
+        if (totalMissingAccessory > 0) missingMsg += `Terdeteksi ${totalMissingAccessory} pcs aksesoris MISSING.\n`;
+        missingMsg += `\nApakah Anda ingin langsung mengajukan Permintaan Material Tambahan kepada ERP?`;
+        
+        const confirm = window.confirm(missingMsg);
         if (confirm) {
           const missingItems = form.items.filter(i => (i.missing_qty || 0) > 0).map(i => ({
             sku: i.sku, product_name: i.product_name, size: i.size, color: i.color,
@@ -1711,7 +1718,7 @@ function VendorMaterialInspection({ token, user }) {
           }
         }
       } else {
-        alert('✅ Inspeksi berhasil disimpan! Semua material lengkap, Anda dapat memulai produksi.');
+        alert('✅ Inspeksi berhasil disimpan! Semua material DAN aksesoris lengkap, Anda dapat memulai produksi.');
       }
     } finally {
       setLoading(false);

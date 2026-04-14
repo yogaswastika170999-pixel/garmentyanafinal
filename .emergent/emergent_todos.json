@@ -1,26 +1,6 @@
 [
   {
-    "content": "Fix tracking dikirim ke buyer - hitung kumulatif dari buyer_shipment_items",
+    "content": "Testing manual untuk verify all fixes",
     "status": "completed"
-  },
-  {
-    "content": "Fix popup inspeksi - tunjukkan missing accessories bukan 'semua bahan diterima'",
-    "status": "pending"
-  },
-  {
-    "content": "Filter PO yang sudah fully shipped di Buyer Shipment creation form (admin ERP)",
-    "status": "pending"
-  },
-  {
-    "content": "Filter job produksi yang sudah fully shipped di Vendor Portal - Pengiriman ke Buyer",
-    "status": "pending"
-  },
-  {
-    "content": "Update production-monitoring-v2 endpoint untuk shipped_to_buyer tracking",
-    "status": "pending"
-  },
-  {
-    "content": "Implement overproduction/underproduction tracking feature (Vendor input + Admin monitor)",
-    "status": "pending"
   }
 ]
