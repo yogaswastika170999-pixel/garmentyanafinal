@@ -840,6 +840,10 @@ async def create_inspection(request: Request):
     db = get_db()
     body = await request.json()
     vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
+    # Try to infer vendor_id from shipment if not provided
+    if not vendor_id and body.get('shipment_id'):
+        ship = await db.vendor_shipments.find_one({'id': body['shipment_id']})
+        if ship: vendor_id = ship.get('vendor_id')
     if not vendor_id: raise HTTPException(400, 'vendor_id diperlukan')
     shipment = await db.vendor_shipments.find_one({'id': body.get('shipment_id')}) if body.get('shipment_id') else None
     if not shipment: raise HTTPException(404, 'Shipment tidak ditemukan')
