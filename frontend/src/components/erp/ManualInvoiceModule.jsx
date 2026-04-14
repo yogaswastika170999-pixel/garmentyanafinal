@@ -1,6 +1,6 @@
 
 import { useState, useEffect } from 'react';
-import { Plus, FileText, RefreshCw, Eye, Edit3, ChevronRight, AlertCircle, CheckCircle, Pencil, ArrowUpCircle, ArrowDownCircle, Trash2, History, Send } from 'lucide-react';
+import { Plus, FileText, RefreshCw, Eye, Edit3, ChevronRight, AlertCircle, AlertTriangle, CheckCircle, Pencil, ArrowUpCircle, ArrowDownCircle, Trash2, History, Send } from 'lucide-react';
 import Modal from './Modal';
 import SearchableSelect from './SearchableSelect';
 import ImportExportPanel from './ImportExportPanel';
