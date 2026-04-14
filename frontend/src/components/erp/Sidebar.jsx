@@ -30,6 +30,7 @@ const menuItems = [
       { id: 'production-returns', label: 'Retur Produksi', icon: RotateCcw, perm: 'po.view' },
       { id: 'work-orders', label: 'Distribusi Kerja', icon: Factory, perm: 'jobs.view' },
       { id: 'production-monitoring', label: 'Monitoring Produksi', icon: BarChart3, perm: 'jobs.view' },
+      { id: 'overproduction', label: 'Over/Under Production', icon: TrendingUp, perm: 'jobs.view' },
     ]
   },
   {

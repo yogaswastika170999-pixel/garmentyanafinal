@@ -11,6 +11,7 @@ import BuyerShipmentModule from './components/erp/BuyerShipmentModule';
 import WorkOrderModule from './components/erp/WorkOrderModule';
 import ProductionProgressModule from './components/erp/ProductionProgressModule';
 import ProductionMonitoringModule from './components/erp/ProductionMonitoringModule';
+import OverproductionModule from './components/erp/OverproductionModule';
 import InvoiceModule from './components/erp/InvoiceModule';
 import PaymentModule from './components/erp/PaymentModule';
 import FinancialRecapModule from './components/erp/FinancialRecapModule';
@@ -169,6 +170,7 @@ function App() {
       case 'work-orders': return <WorkOrderModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
       case 'production-progress': return <ProductionProgressModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
       case 'production-monitoring': return <ProductionMonitoringModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'overproduction': return <OverproductionModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
       case 'production-returns': return <ProductionReturnModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
       case 'accounts-payable': return <AccountsPayableModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
       case 'accounts-receivable': return <AccountsReceivableModule token={token} userRole={user?.role} hasPerm={hasPerm} />;

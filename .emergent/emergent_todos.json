@@ -1,14 +1,10 @@
 [
   {
-    "content": "Backend: Production variances endpoints (POST, GET, GET /stats, PUT)",
+    "content": "Create OverproductionModule.jsx dengan list, filters, stats, dan update status",
     "status": "completed"
   },
   {
-    "content": "Frontend: Add Variance Report menu di Vendor Portal dengan form input",
-    "status": "in_progress"
-  },
-  {
-    "content": "Frontend: Add Overproduction & Underproduction menu di Admin ERP dengan list & filters",
-    "status": "pending"
+    "content": "Test end-to-end variance flow (vendor create → admin review)",
+    "status": "completed"
   }
 ]
