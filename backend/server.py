@@ -335,7 +335,7 @@ async def create_product(request: Request):
     if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
     db = get_db()
     body = await request.json()
-    product = {'id': new_id(), **body, 'status': body.get('status', 'active'), 'created_at': now(), 'updated_at': now()}
+    product = {'id': new_id(), **body, 'status': body.get('status', 'active'), 'photo_url': '', 'created_at': now(), 'updated_at': now()}
     await db.products.insert_one(product)
     await log_activity(user['id'], user['name'], 'Create', 'Products', f"Created product: {product.get('product_name')}")
     return JSONResponse(serialize_doc(product), status_code=201)
@@ -957,12 +957,14 @@ async def create_inspection(request: Request):
                 'po_id': po_id, 'po_number': po_number,
                 'vendor_id': vendor_id, 'vendor_name': shipment.get('vendor_name', ''),
                 'request_type': 'ADDITIONAL', 'category': 'accessories',
-                'shipment_id': body.get('shipment_id'),
+                'original_shipment_id': body.get('shipment_id'),
+                'original_shipment_number': shipment.get('shipment_number', ''),
                 'reason': f"Aksesoris kurang saat inspeksi: {acc_details}",
-                'notes_for_vendor': '',
+                'vendor_notes': '',
                 'status': 'Pending',
+                'total_requested_qty': sum(int(a.get('missing_qty', 0)) for a in missing_accessories),
                 'items': [{'accessory_name': a.get('accessory_name', ''), 'accessory_code': a.get('accessory_code', ''),
-                           'missing_qty': int(a.get('missing_qty', 0)), 'unit': a.get('unit', 'pcs')} for a in missing_accessories],
+                           'requested_qty': int(a.get('missing_qty', 0)), 'unit': a.get('unit', 'pcs')} for a in missing_accessories],
                 'created_by': user['name'], 'created_at': now(), 'updated_at': now()
             }
             await db.material_requests.insert_one(req_doc)

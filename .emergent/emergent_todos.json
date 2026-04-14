@@ -1,26 +1,6 @@
 [
   {
-    "content": "Perbaiki syntax error di ProductionPOModule.jsx (missing Fragment <>)",
+    "content": "Update plan.md ke status COMPLETED untuk Phase 9 & 10",
     "status": "completed"
-  },
-  {
-    "content": "Verifikasi frontend bisa compile tanpa error",
-    "status": "completed"
-  },
-  {
-    "content": "Panggil Testing Agent untuk comprehensive testing (RBAC, auto-material request, thumbnails, PDF per-dispatch)",
-    "status": "pending"
-  },
-  {
-    "content": "Fix semua bugs yang dilaporkan Testing Agent (jika ada)",
-    "status": "pending"
-  },
-  {
-    "content": "Buat file DESIGN_TECHNICAL_DOCUMENT.md dengan dokumentasi lengkap fitur-fitur baru",
-    "status": "pending"
-  },
-  {
-    "content": "Update plan.md ke status COMPLETED untuk Phase 9",
-    "status": "pending"
   }
 ]
