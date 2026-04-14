@@ -676,11 +676,14 @@ async def get_vendor_shipment(sid: str, request: Request):
     s = await db.vendor_shipments.find_one({'id': sid}, {'_id': 0})
     if not s: raise HTTPException(404, 'Not found')
     items = await db.vendor_shipment_items.find({'shipment_id': sid}, {'_id': 0}).to_list(None)
+    # Get accessory shipment items if this is an accessory additional shipment
+    accessory_items = await db.accessory_shipment_items.find({'shipment_id': sid}, {'_id': 0}).to_list(None)
     child_ships = await db.vendor_shipments.find({'parent_shipment_id': sid}, {'_id': 0}).to_list(None)
     child_with_items = []
     for cs in child_ships:
         cs_items = await db.vendor_shipment_items.find({'shipment_id': cs['id']}, {'_id': 0}).to_list(None)
-        child_with_items.append({**serialize_doc(cs), 'items': serialize_doc(cs_items)})
+        cs_acc_items = await db.accessory_shipment_items.find({'shipment_id': cs['id']}, {'_id': 0}).to_list(None)
+        child_with_items.append({**serialize_doc(cs), 'items': serialize_doc(cs_items), 'accessory_items': serialize_doc(cs_acc_items)})
     # Collect PO accessories from linked POs
     po_ids = set()
     if s.get('po_id'): po_ids.add(s['po_id'])
@@ -699,6 +702,7 @@ async def get_vendor_shipment(sid: str, request: Request):
     items = await enrich_with_product_photos(items, db)
     result = serialize_doc(s)
     result['items'] = serialize_doc(items)
+    result['accessory_items'] = serialize_doc(accessory_items)
     result['child_shipments'] = child_with_items
     result['po_accessories'] = serialize_doc(po_accessories_all)
     return result
@@ -1806,36 +1810,56 @@ async def update_material_request(req_id: str, request: Request):
             'created_by': user['name'], 'created_at': now(), 'updated_at': now()
         }
         await db.vendor_shipments.insert_one(child_ship)
-        # Get original shipment items to inherit serial numbers
-        orig_items_map = {}
-        orig_si_list = await db.vendor_shipment_items.find({'shipment_id': orig['id']}).to_list(None)
-        for osi in orig_si_list:
-            if osi.get('po_item_id'):
-                orig_items_map[osi['po_item_id']] = osi
-        for ri in req.get('items', []):
-            # Inherit serial_number from original shipment item or PO item
-            serial = ri.get('serial_number', '')
-            po_item_id = ri.get('po_item_id', '')
-            if not serial and po_item_id:
-                # Try original shipment item
-                orig_si = orig_items_map.get(po_item_id, {})
-                serial = orig_si.get('serial_number', '')
-            if not serial and po_item_id:
-                # Try PO item
-                poi = await db.po_items.find_one({'id': po_item_id})
-                if poi: serial = poi.get('serial_number', '')
-            await db.vendor_shipment_items.insert_one({
-                'id': new_id(), 'shipment_id': child_id, 'shipment_number': child_number,
-                'po_id': req.get('po_id'), 'po_number': req.get('po_number', ''),
-                'po_item_id': po_item_id,
-                'product_name': ri.get('product_name', ''), 'sku': ri.get('sku', ''),
-                'size': ri.get('size', ''), 'color': ri.get('color', ''),
-                'serial_number': serial,
-                'qty_sent': int(ri.get('requested_qty', 0) or 0),
-                'shipment_type': req['request_type'],
-                'parent_shipment_id': req['original_shipment_id'],
-                'created_at': now()
-            })
+        # Check if this is an accessories-only request
+        is_accessories_request = req.get('category') == 'accessories'
+        
+        if is_accessories_request:
+            # For accessories request, create accessory shipment items only
+            for ri in req.get('items', []):
+                await db.accessory_shipment_items.insert_one({
+                    'id': new_id(), 'shipment_id': child_id, 'shipment_number': child_number,
+                    'po_id': req.get('po_id'), 'po_number': req.get('po_number', ''),
+                    'accessory_id': ri.get('accessory_id', ''),
+                    'accessory_name': ri.get('accessory_name', ''),
+                    'accessory_code': ri.get('accessory_code', ''),
+                    'qty_sent': int(ri.get('requested_qty', 0) or 0),
+                    'unit': ri.get('unit', 'pcs'),
+                    'shipment_type': req['request_type'],
+                    'parent_shipment_id': req['original_shipment_id'],
+                    'created_at': now()
+                })
+        else:
+            # For material request, create vendor shipment items
+            # Get original shipment items to inherit serial numbers
+            orig_items_map = {}
+            orig_si_list = await db.vendor_shipment_items.find({'shipment_id': orig['id']}).to_list(None)
+            for osi in orig_si_list:
+                if osi.get('po_item_id'):
+                    orig_items_map[osi['po_item_id']] = osi
+            for ri in req.get('items', []):
+                # Inherit serial_number from original shipment item or PO item
+                serial = ri.get('serial_number', '')
+                po_item_id = ri.get('po_item_id', '')
+                if not serial and po_item_id:
+                    # Try original shipment item
+                    orig_si = orig_items_map.get(po_item_id, {})
+                    serial = orig_si.get('serial_number', '')
+                if not serial and po_item_id:
+                    # Try PO item
+                    poi = await db.po_items.find_one({'id': po_item_id})
+                    if poi: serial = poi.get('serial_number', '')
+                await db.vendor_shipment_items.insert_one({
+                    'id': new_id(), 'shipment_id': child_id, 'shipment_number': child_number,
+                    'po_id': req.get('po_id'), 'po_number': req.get('po_number', ''),
+                    'po_item_id': po_item_id,
+                    'product_name': ri.get('product_name', ''), 'sku': ri.get('sku', ''),
+                    'size': ri.get('size', ''), 'color': ri.get('color', ''),
+                    'serial_number': serial,
+                    'qty_sent': int(ri.get('requested_qty', 0) or 0),
+                    'shipment_type': req['request_type'],
+                    'parent_shipment_id': req['original_shipment_id'],
+                    'created_at': now()
+                })
         await db.material_requests.update_one({'id': req_id}, {'$set': {
             'status': 'Approved', 'admin_notes': body.get('admin_notes', ''),
             'approved_by': user['name'], 'approved_at': now(),
@@ -2595,6 +2619,9 @@ async def distribusi_kerja(request: Request):
             # Get production info
             ji_list = await db.production_job_items.find({'po_item_id': pi['id']}).to_list(None)
             produced_qty = sum(j.get('produced_qty', 0) for j in ji_list)
+            # Get shipped to buyer info (from buyer_shipment_items)
+            buyer_items = await db.buyer_shipment_items.find({'po_item_id': pi['id']}).to_list(None)
+            shipped_to_buyer_qty = sum(bi.get('qty_shipped', 0) for bi in buyer_items)
             ordered_qty = pi.get('qty', 0)
             progress_pct = round((produced_qty / ordered_qty * 100) if ordered_qty > 0 else 0)
             flat_rows.append({
@@ -2608,6 +2635,7 @@ async def distribusi_kerja(request: Request):
                 'size': pi.get('size', ''), 'color': pi.get('color', ''),
                 'ordered_qty': ordered_qty, 'shipment_qty': total_sent,
                 'received_qty': total_received, 'produced_qty': produced_qty,
+                'shipped_to_buyer_qty': shipped_to_buyer_qty,
                 'progress_pct': progress_pct,
             })
     # Build hierarchy
@@ -2616,28 +2644,31 @@ async def distribusi_kerja(request: Request):
         vid = row.get('vendor_id')
         if vid not in vendor_map:
             vendor_map[vid] = {'vendor_id': vid, 'vendor_name': row.get('vendor_name'),
-                               'total_ordered': 0, 'total_received': 0, 'total_produced': 0, 'pos': {}}
+                               'total_ordered': 0, 'total_received': 0, 'total_produced': 0, 'total_shipped_to_buyer': 0, 'pos': {}}
         vm = vendor_map[vid]
         vm['total_ordered'] += row.get('ordered_qty', 0)
         vm['total_received'] += row.get('received_qty', 0)
         vm['total_produced'] += row.get('produced_qty', 0)
+        vm['total_shipped_to_buyer'] += row.get('shipped_to_buyer_qty', 0)
         po_key = row.get('po_id', 'unknown')
         if po_key not in vm['pos']:
             vm['pos'][po_key] = {'po_id': row.get('po_id'), 'po_number': row.get('po_number'),
                                   'customer_name': row.get('customer_name'),
-                                  'total_ordered': 0, 'total_received': 0, 'total_produced': 0, 'serials': {}}
+                                  'total_ordered': 0, 'total_received': 0, 'total_produced': 0, 'total_shipped_to_buyer': 0, 'serials': {}}
         pm = vm['pos'][po_key]
         pm['total_ordered'] += row.get('ordered_qty', 0)
         pm['total_received'] += row.get('received_qty', 0)
         pm['total_produced'] += row.get('produced_qty', 0)
+        pm['total_shipped_to_buyer'] += row.get('shipped_to_buyer_qty', 0)
         sn = row.get('serial_number', '__no_serial__')
         if sn not in pm['serials']:
             pm['serials'][sn] = {'serial_number': row.get('serial_number', ''),
-                                  'total_ordered': 0, 'total_received': 0, 'total_produced': 0, 'skus': []}
+                                  'total_ordered': 0, 'total_received': 0, 'total_produced': 0, 'total_shipped_to_buyer': 0, 'skus': []}
         sm = pm['serials'][sn]
         sm['total_ordered'] += row.get('ordered_qty', 0)
         sm['total_received'] += row.get('received_qty', 0)
         sm['total_produced'] += row.get('produced_qty', 0)
+        sm['total_shipped_to_buyer'] += row.get('shipped_to_buyer_qty', 0)
         sm['skus'].append(row)
     hierarchy = []
     for vm in vendor_map.values():

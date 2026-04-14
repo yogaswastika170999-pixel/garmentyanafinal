@@ -1,18 +1,10 @@
 [
   {
-    "content": "Fix accessory material request & inspection flow - nama aksesoris tidak ditampilkan",
-    "status": "pending"
+    "content": "Fix tracking dikirim ke buyer - hitung kumulatif dari buyer_shipment_items",
+    "status": "completed"
   },
   {
-    "content": "Fix inspection aksesoris - additional shipment seharusnya hanya untuk qty missing, bukan qty penuh",
-    "status": "pending"
-  },
-  {
-    "content": "Fix popup inspeksi - harus tunjukkan missing accessories, bukan 'semua bahan diterima'",
-    "status": "pending"
-  },
-  {
-    "content": "Fix tracking dikirim ke buyer - hitung buyer shipment dispatches di Distribusi Kerja & Monitoring",
+    "content": "Fix popup inspeksi - tunjukkan missing accessories bukan 'semua bahan diterima'",
     "status": "pending"
   },
   {
@@ -24,7 +16,11 @@
     "status": "pending"
   },
   {
-    "content": "Cek overproduction/underproduction feature - API & FE implementation status",
+    "content": "Update production-monitoring-v2 endpoint untuk shipped_to_buyer tracking",
+    "status": "pending"
+  },
+  {
+    "content": "Implement overproduction/underproduction tracking feature (Vendor input + Admin monitor)",
     "status": "pending"
   }
 ]
