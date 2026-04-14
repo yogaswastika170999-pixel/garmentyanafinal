@@ -71,9 +71,9 @@ function ShipmentList({ token, userRole, hasPerm = () => false }) {
   });
 
   const isSuperAdmin = userRole === 'superadmin';
-  const canCreate = ['superadmin', 'admin'].includes(userRole) || hasPerm('vendor_shipment.create') || hasPerm('shipment.create');
-  const canDelete = ['superadmin', 'admin'].includes(userRole) || hasPerm('vendor_shipment.delete') || hasPerm('shipment.delete');
-  const canEdit = ['superadmin', 'admin'].includes(userRole) || hasPerm('vendor_shipment.update') || hasPerm('shipment.update');
+  const canCreate = userRole === 'superadmin' || hasPerm('vendor_shipment.create') || hasPerm('shipment.create');
+  const canDelete = userRole === 'superadmin' || hasPerm('vendor_shipment.delete') || hasPerm('shipment.delete');
+  const canEdit = userRole === 'superadmin' || hasPerm('vendor_shipment.update') || hasPerm('shipment.update');
 
   useEffect(() => { fetchAll(); }, []);
 

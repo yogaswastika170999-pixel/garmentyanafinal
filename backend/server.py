@@ -136,18 +136,26 @@ async def auth_me(request: Request):
     # Include user permissions for RBAC
     user_perms = []
     role = u.get('role', '') if u else ''
-    if role in ('superadmin', 'admin'):
+    
+    if role == 'superadmin':
         user_perms = ['*']  # Full access
     elif role == 'vendor':
         user_perms = ['dashboard.view', 'shipment.view', 'jobs.view', 'jobs.create', 'progress.view', 'progress.create']
     elif role == 'buyer':
         user_perms = ['dashboard.view', 'po.view', 'shipment.view']
     else:
-        # Check custom role permissions
-        custom_role = await db.roles.find_one({'name': role})
-        if custom_role:
-            role_perms = await db.role_permissions.find({'role_id': custom_role['id']}, {'_id': 0}).to_list(None)
+        # Check if this is a custom role
+        if u.get('role_id'):
+            # User has custom role assigned via role_id
+            role_perms = await db.role_permissions.find({'role_id': u['role_id']}, {'_id': 0}).to_list(None)
             user_perms = [rp.get('permission_key') for rp in role_perms]
+        else:
+            # Try to find role by name (legacy)
+            custom_role = await db.roles.find_one({'name': role})
+            if custom_role:
+                role_perms = await db.role_permissions.find({'role_id': custom_role['id']}, {'_id': 0}).to_list(None)
+                user_perms = [rp.get('permission_key') for rp in role_perms]
+    
     result = serialize_doc(u) if u else {}
     result['permissions'] = user_perms
     return result

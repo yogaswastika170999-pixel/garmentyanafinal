@@ -155,8 +155,8 @@ function App() {
   // MAIN ERP SYSTEM
   const userPerms = user?.permissions || [];
   const hasPerm = (key) => {
-    if (user?.role === 'superadmin' || user?.role === 'admin') return true;
-    return userPerms.includes(key);
+    if (user?.role === 'superadmin') return true;
+    return userPerms.includes(key) || userPerms.includes(key.split('.')[0] + '.*');
   };
   const renderModule = () => {
     switch (currentModule) {
