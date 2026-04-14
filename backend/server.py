@@ -4947,6 +4947,21 @@ async def add_po_accessory(request: Request):
             'qty_needed': int(item.get('qty_needed', 0) or 0),
             'unit': item.get('unit', 'pcs'),
             'notes': item.get('notes', ''),
+            'created_at': now()
+        }
+        await db.po_accessories.insert_one(acc_doc)
+        inserted.append(acc_doc)
+    await log_activity(user['id'], user['name'], 'Add Accessories', 'Production PO',
+                       f"Added {len(inserted)} accessories to PO")
+    return JSONResponse(serialize_doc(inserted), status_code=201)
+
+@api.delete("/po-accessories/{acc_id}")
+async def remove_po_accessory(acc_id: str, request: Request):
+    user = await require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    await db.po_accessories.delete_one({'id': acc_id})
+    return {'success': True}
 
 # ─── PRODUCTION VARIANCES (OVERPRODUCTION/UNDERPRODUCTION) ──────────────────
 @api.post("/production-variances")
@@ -5129,23 +5144,6 @@ async def update_variance_status(vid: str, request: Request):
     await log_activity(user['id'], user['name'], 'Update', 'Production Variance',
                       f"Updated variance status to {body.get('status')} for {variance.get('job_number')}")
     
-    return {'success': True}
-
-
-            'created_at': now()
-        }
-        await db.po_accessories.insert_one(acc_doc)
-        inserted.append(acc_doc)
-    await log_activity(user['id'], user['name'], 'Add Accessories', 'Production PO',
-                       f"Added {len(inserted)} accessories to PO")
-    return JSONResponse(serialize_doc(inserted), status_code=201)
-
-@api.delete("/po-accessories/{acc_id}")
-async def remove_po_accessory(acc_id: str, request: Request):
-    user = await require_auth(request)
-    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
-    db = get_db()
-    await db.po_accessories.delete_one({'id': acc_id})
     return {'success': True}
 
 # ─── RATE LIMITING MIDDLEWARE ────────────────────────────────────────────────
