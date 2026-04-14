@@ -17,23 +17,23 @@
   },
   {
     "content": "Phase 2: Frontend - Show accessories in PO Detail modal (ProductionPOModule)",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
     "content": "Phase 2: Frontend - Show PO accessories when selecting PO in shipment creation (VendorShipmentModule)",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
     "content": "Phase 2: Frontend - Show PO accessories in shipment detail (VendorShipmentModule)",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
     "content": "Phase 2: Frontend - Show PO accessories in Vendor Portal (VendorPortalApp)",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
     "content": "Phase 2: End-to-end testing using Testing Agent",
-    "status": "pending"
+    "status": "completed"
   },
   {
     "content": "Phase 3: Dashboard UI/UX improvements",
