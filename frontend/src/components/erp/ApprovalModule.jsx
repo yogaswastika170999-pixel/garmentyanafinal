@@ -159,7 +159,7 @@ export default function ApprovalModule({ token, userRole }) {
         <div key="notes" className="grid grid-cols-2 gap-4">
           <div className="bg-red-50 border border-red-200 rounded-lg p-3">
             <p className="text-xs text-red-600 font-medium mb-1">BEFORE - Catatan</p>
-            <p className="text-sm text-slate-700">{discountChange.before || '-'}</p>
+            <p className="text-sm text-slate-700">{notesChange.before || '-'}</p>
           </div>
           <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
             <p className="text-xs text-emerald-600 font-medium mb-1">AFTER - Catatan</p>
