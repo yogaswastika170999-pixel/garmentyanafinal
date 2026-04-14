@@ -1,73 +1,4575 @@
-from fastapi import FastAPI, APIRouter
-from dotenv import load_dotenv
+from fastapi import FastAPI, APIRouter, Request, HTTPException, UploadFile, File, Form
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+from database import get_db, client
+from auth import (verify_token, require_auth, check_role, hash_password, verify_password,
+                  create_token, log_activity, seed_initial_data, serialize_doc, generate_password)
+from cascade_delete import cascade_delete_po
+import uuid
 import os
 import logging
-from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List
-import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from io import BytesIO
+import json
 
-
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
-
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
-
-# Create the main app without a prefix
 app = FastAPI()
+api = APIRouter(prefix="/api")
 
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ─── STARTUP ─────────────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def startup():
+    await seed_initial_data()
+    await create_indexes()
+    # Init persistent storage
+    try:
+        from storage import init_storage
+        init_storage()
+    except Exception as e:
+        logger.warning(f"Storage init: {e}")
+    logger.info("Garment ERP API started")
+
+async def create_indexes():
+    """Create MongoDB indexes for performance."""
+    db = get_db()
+    try:
+        await db.po_items.create_index("po_id")
+        await db.po_items.create_index("id", unique=True)
+        await db.vendor_shipment_items.create_index("shipment_id")
+        await db.vendor_shipment_items.create_index("po_item_id")
+        await db.production_job_items.create_index("job_id")
+        await db.production_job_items.create_index("po_item_id")
+        await db.production_job_items.create_index("vendor_shipment_item_id")
+        await db.production_progress.create_index("job_item_id")
+        await db.production_progress.create_index([("job_id", 1), ("job_item_id", 1)])
+        await db.buyer_shipment_items.create_index("shipment_id")
+        await db.buyer_shipment_items.create_index("po_item_id")
+        await db.invoices.create_index("po_id")
+        await db.invoices.create_index("invoice_category")
+        await db.activity_logs.create_index([("timestamp", -1)])
+        await db.production_jobs.create_index("vendor_id")
+        await db.production_jobs.create_index("parent_job_id")
+        await db.production_jobs.create_index("vendor_shipment_id")
+        await db.vendor_shipments.create_index("vendor_id")
+        await db.vendor_shipments.create_index("parent_shipment_id")
+        await db.vendor_material_inspections.create_index("shipment_id")
+        await db.vendor_material_inspection_items.create_index("inspection_id")
+        await db.material_requests.create_index("vendor_id")
+        await db.material_defect_reports.create_index("vendor_id")
+        await db.buyer_shipments.create_index("po_id")
+        await db.buyer_shipments.create_index("vendor_id")
+        # Accessory indexes
+        await db.accessories.create_index("status")
+        await db.accessory_shipments.create_index("po_id")
+        await db.accessory_shipment_items.create_index("shipment_id")
+        # RBAC indexes
+        await db.roles.create_index("name", unique=True)
+        await db.permissions.create_index("key", unique=True)
+        logger.info("MongoDB indexes created")
+    except Exception as e:
+        logger.warning(f"Index creation warning: {e}")
+
+# Valid PO statuses (staged lifecycle)
+PO_STATUSES = [
+    "Draft", "Confirmed", "Distributed", "In Production", 
+    "Production Complete", "Variance Review", "Return Review",
+    "Ready to Close", "Closed"
+]
+
+@app.on_event("shutdown")
+async def shutdown():
+    client.close()
+
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
+def new_id():
+    return str(uuid.uuid4())
+
+def now():
+    return datetime.now(timezone.utc)
+
+def parse_date(d):
+    if not d: return None
+    if isinstance(d, datetime): return d
+    try: return datetime.fromisoformat(str(d).replace('Z', '+00:00'))
+    except: return None
+
+def to_end_of_day(d):
+    if isinstance(d, str):
+        d = parse_date(d)
+    if d:
+        return d.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return None
+
+# ─── AUTH ────────────────────────────────────────────────────────────────────
+@api.post("/auth/login")
+async def login(request: Request):
+    body = await request.json()
+    db = get_db()
+    email = body.get('email', '')
+    password = body.get('password', '')
+    u = await db.users.find_one({'email': email})
+    if not u or not verify_password(password, u['password']):
+        raise HTTPException(401, 'Email atau password salah')
+    if u.get('status') != 'active':
+        raise HTTPException(403, 'Akun tidak aktif')
+    token = create_token(u)
+    await log_activity(u['id'], u['name'], 'Login', 'Auth', f"User {u['email']} logged in")
+    return {'token': token, 'user': {'id': u['id'], 'name': u['name'], 'email': u['email'], 'role': u['role'],
+            'vendor_id': u.get('vendor_id'), 'buyer_id': u.get('buyer_id'),
+            'customer_name': u.get('customer_name', u.get('buyer_company', ''))}}
+
+@api.get("/auth/me")
+async def auth_me(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    u = await db.users.find_one({'id': user['id']}, {'password': 0, '_id': 0})
+    # Include user permissions for RBAC
+    user_perms = []
+    role = u.get('role', '') if u else ''
+    if role in ('superadmin', 'admin'):
+        user_perms = ['*']  # Full access
+    elif role == 'vendor':
+        user_perms = ['dashboard.view', 'shipment.view', 'jobs.view', 'jobs.create', 'progress.view', 'progress.create']
+    elif role == 'buyer':
+        user_perms = ['dashboard.view', 'po.view', 'shipment.view']
+    else:
+        # Check custom role permissions
+        custom_role = await db.roles.find_one({'name': role})
+        if custom_role:
+            role_perms = await db.role_permissions.find({'role_id': custom_role['id']}, {'_id': 0}).to_list(None)
+            user_perms = [rp.get('permission_key') for rp in role_perms]
+    result = serialize_doc(u) if u else {}
+    result['permissions'] = user_perms
+    return result
+
+# ─── GARMENTS ────────────────────────────────────────────────────────────────
+@api.get("/garments")
+async def get_garments(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    query = {}
+    sp = request.query_params
+    search = sp.get('search')
+    status = sp.get('status')
+    if search:
+        query['$or'] = [{'garment_name': {'$regex': search, '$options': 'i'}}, {'garment_code': {'$regex': search, '$options': 'i'}}]
+    if status: query['status'] = status
+    if user.get('role') == 'vendor': query['id'] = user.get('vendor_id')
+    docs = await db.garments.find(query, {'_id': 0}).sort('created_at', -1).to_list(None)
+    return serialize_doc(docs)
+
+@api.get("/garments/{gid}")
+async def get_garment(gid: str, request: Request):
+    require_auth(request)
+    db = get_db()
+    doc = await db.garments.find_one({'id': gid}, {'_id': 0})
+    if not doc: raise HTTPException(404, 'Not found')
+    return serialize_doc(doc)
+
+@api.post("/garments")
+async def create_garment(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    garment_id = new_id()
+    code_slug = (body.get('garment_code', garment_id)).lower()
+    code_slug = ''.join(c for c in code_slug if c.isalnum())
+    vendor_email = f"vendor.{code_slug}@garment.com"
+    raw_password = generate_password(10)
+    hashed = hash_password(raw_password)
+    await db.users.insert_one({
+        'id': new_id(), 'name': body.get('garment_name', ''), 'email': vendor_email,
+        'password': hashed, 'role': 'vendor', 'vendor_id': garment_id,
+        'status': 'active', 'created_at': now(), 'updated_at': now()
+    })
+    garment = {'id': garment_id, **body, 'status': body.get('status', 'active'),
+               'login_email': vendor_email, 'vendor_password_plain': raw_password,
+               'created_at': now(), 'updated_at': now()}
+    await db.garments.insert_one(garment)
+    await log_activity(user['id'], user['name'], 'Create', 'Garments', f"Created garment: {garment.get('garment_name')}")
+    result = serialize_doc(garment)
+    result['vendor_account'] = {'email': vendor_email, 'password': raw_password}
+    return JSONResponse(result, status_code=201)
+
+@api.put("/garments/{gid}")
+async def update_garment(gid: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    body.pop('_id', None); body.pop('id', None); body.pop('vendor_account', None)
+    await db.garments.update_one({'id': gid}, {'$set': {**body, 'updated_at': now()}})
+    if body.get('garment_name'):
+        await db.users.update_one({'vendor_id': gid}, {'$set': {'name': body['garment_name'], 'updated_at': now()}})
+    await log_activity(user['id'], user['name'], 'Update', 'Garments', f"Updated garment: {gid}")
+    doc = await db.garments.find_one({'id': gid}, {'_id': 0})
+    return serialize_doc(doc)
+
+@api.delete("/garments/{gid}")
+async def delete_garment(gid: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden: Only Superadmin can delete')
+    db = get_db()
+    doc = await db.garments.find_one({'id': gid})
+    if not doc: raise HTTPException(404, 'Not found')
+    vendor_pos = await db.production_pos.find({'vendor_id': gid}).to_list(None)
+    for po in vendor_pos:
+        await cascade_delete_po(po['id'])
+    await db.material_requests.delete_many({'vendor_id': gid})
+    await db.material_defect_reports.delete_many({'vendor_id': gid})
+    await db.users.delete_many({'vendor_id': gid})
+    await db.garments.delete_one({'id': gid})
+    await log_activity(user['id'], user['name'], 'Delete', 'Garments', f"Cascade deleted garment: {doc.get('garment_name')}")
+    return {'success': True, 'deleted_pos': len(vendor_pos)}
+
+# ─── BUYERS (Master Data) ────────────────────────────────────────────────────
+@api.get("/buyers")
+async def get_buyers(request: Request):
+    require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    query = {}
+    search = sp.get('search')
+    if search:
+        query['$or'] = [{'buyer_name': {'$regex': search, '$options': 'i'}}, {'buyer_code': {'$regex': search, '$options': 'i'}}]
+    if sp.get('status'): query['status'] = sp['status']
+    page = int(sp.get('page', 1)); limit = int(sp.get('limit', 100))
+    skip = (page - 1) * limit
+    total = await db.buyers.count_documents(query)
+    docs = await db.buyers.find(query, {'_id': 0}).sort('created_at', -1).skip(skip).limit(limit).to_list(None)
+    return {'data': serialize_doc(docs), 'total': total, 'page': page, 'limit': limit} if sp.get('paginated') else serialize_doc(docs)
+
+@api.get("/buyers/{bid}")
+async def get_buyer(bid: str, request: Request):
+    require_auth(request)
+    db = get_db()
+    doc = await db.buyers.find_one({'id': bid}, {'_id': 0})
+    if not doc: raise HTTPException(404, 'Not found')
+    return serialize_doc(doc)
+
+@api.post("/buyers")
+async def create_buyer(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    buyer_id = new_id()
+    code_slug = (body.get('buyer_code', buyer_id)).lower()
+    code_slug = ''.join(c for c in code_slug if c.isalnum())
+    buyer_email = f"buyer.{code_slug}@garment.com"
+    raw_password = generate_password(10)
+    hashed = hash_password(raw_password)
+    # Auto-create buyer portal account
+    await db.users.insert_one({
+        'id': new_id(), 'name': body.get('buyer_name', ''), 'email': buyer_email,
+        'password': hashed, 'role': 'buyer', 'buyer_id': buyer_id,
+        'customer_name': body.get('buyer_name', ''),
+        'buyer_company': body.get('buyer_name', ''),
+        'status': 'active', 'created_at': now(), 'updated_at': now()
+    })
+    buyer = {
+        'id': buyer_id, **body, 'status': body.get('status', 'active'),
+        'login_email': buyer_email, 'buyer_password_plain': raw_password,
+        'created_at': now(), 'updated_at': now()
+    }
+    await db.buyers.insert_one(buyer)
+    await log_activity(user['id'], user['name'], 'Create', 'Buyers', f"Created buyer: {body.get('buyer_name')}, account: {buyer_email}")
+    result = serialize_doc(buyer)
+    result['buyer_account'] = {'email': buyer_email, 'password': raw_password}
+    return JSONResponse(result, status_code=201)
+
+@api.put("/buyers/{bid}")
+async def update_buyer(bid: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    body.pop('_id', None); body.pop('id', None); body.pop('buyer_account', None)
+    await db.buyers.update_one({'id': bid}, {'$set': {**body, 'updated_at': now()}})
+    if body.get('buyer_name'):
+        await db.users.update_one({'buyer_id': bid}, {'$set': {'name': body['buyer_name'], 'customer_name': body['buyer_name'], 'updated_at': now()}})
+    await log_activity(user['id'], user['name'], 'Update', 'Buyers', f"Updated buyer: {bid}")
+    return serialize_doc(await db.buyers.find_one({'id': bid}, {'_id': 0}))
+
+@api.delete("/buyers/{bid}")
+async def delete_buyer(bid: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    doc = await db.buyers.find_one({'id': bid})
+    if not doc: raise HTTPException(404, 'Not found')
+    await db.users.delete_many({'buyer_id': bid})
+    await db.buyers.delete_one({'id': bid})
+    await log_activity(user['id'], user['name'], 'Delete', 'Buyers', f"Deleted buyer: {doc.get('buyer_name')}")
+    return {'success': True}
+
+# ─── PRODUCTS ────────────────────────────────────────────────────────────────
+@api.get("/products")
+async def get_products(request: Request):
+    require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    query = {}
+    search = sp.get('search')
+    if search:
+        query['$or'] = [{'product_name': {'$regex': search, '$options': 'i'}}, {'product_code': {'$regex': search, '$options': 'i'}}]
+    return serialize_doc(await db.products.find(query, {'_id': 0}).sort('created_at', -1).to_list(None))
+
+@api.get("/products/{pid}")
+async def get_product(pid: str, request: Request):
+    require_auth(request)
+    db = get_db()
+    p = await db.products.find_one({'id': pid}, {'_id': 0})
+    if not p: raise HTTPException(404, 'Not found')
+    variants = await db.product_variants.find({'product_id': pid}, {'_id': 0}).sort('created_at', 1).to_list(None)
+    result = serialize_doc(p)
+    result['variants'] = serialize_doc(variants)
+    return result
+
+@api.post("/products")
+async def create_product(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    product = {'id': new_id(), **body, 'status': body.get('status', 'active'), 'created_at': now(), 'updated_at': now()}
+    await db.products.insert_one(product)
+    await log_activity(user['id'], user['name'], 'Create', 'Products', f"Created product: {product.get('product_name')}")
+    return JSONResponse(serialize_doc(product), status_code=201)
+
+@api.put("/products/{pid}")
+async def update_product(pid: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    body.pop('_id', None); body.pop('id', None)
+    await db.products.update_one({'id': pid}, {'$set': {**body, 'updated_at': now()}})
+    await log_activity(user['id'], user['name'], 'Update', 'Products', f"Updated product: {pid}")
+    return serialize_doc(await db.products.find_one({'id': pid}, {'_id': 0}))
+
+@api.delete("/products/{pid}")
+async def delete_product(pid: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    doc = await db.products.find_one({'id': pid})
+    if not doc: raise HTTPException(404, 'Not found')
+    await db.products.delete_one({'id': pid})
+    await db.product_variants.delete_many({'product_id': pid})
+    await log_activity(user['id'], user['name'], 'Delete', 'Products', f"Deleted product: {doc.get('product_name')}")
+    return {'success': True}
+
+# ─── PRODUCT VARIANTS ────────────────────────────────────────────────────────
+@api.get("/product-variants")
+async def get_variants(request: Request):
+    require_auth(request)
+    db = get_db()
+    query = {}
+    pid = request.query_params.get('product_id')
+    if pid: query['product_id'] = pid
+    return serialize_doc(await db.product_variants.find(query, {'_id': 0}).sort('created_at', 1).to_list(None))
+
+@api.get("/product-variants/{vid}")
+async def get_variant(vid: str, request: Request):
+    require_auth(request)
+    db = get_db()
+    v = await db.product_variants.find_one({'id': vid}, {'_id': 0})
+    if not v: raise HTTPException(404, 'Not found')
+    return serialize_doc(v)
+
+@api.post("/product-variants")
+async def create_variant(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    product = await db.products.find_one({'id': body.get('product_id')})
+    if not product: raise HTTPException(404, 'Product not found')
+    variant = {
+        'id': new_id(), 'product_id': body['product_id'],
+        'product_code': product.get('product_code', ''), 'product_name': product.get('product_name', ''),
+        'size': body.get('size', ''), 'color': body.get('color', ''), 'sku': body.get('sku', ''),
+        'status': 'active', 'created_at': now()
+    }
+    await db.product_variants.insert_one(variant)
+    await log_activity(user['id'], user['name'], 'Create', 'Product Variants', f"Added variant SKU: {body.get('sku')}")
+    return JSONResponse(serialize_doc(variant), status_code=201)
+
+@api.put("/product-variants/{vid}")
+async def update_variant(vid: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    body.pop('_id', None); body.pop('id', None)
+    await db.product_variants.update_one({'id': vid}, {'$set': {**body, 'updated_at': now()}})
+    return serialize_doc(await db.product_variants.find_one({'id': vid}, {'_id': 0}))
+
+@api.delete("/product-variants/{vid}")
+async def delete_variant(vid: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    doc = await db.product_variants.find_one({'id': vid})
+    if not doc: raise HTTPException(404, 'Not found')
+    await db.product_variants.delete_one({'id': vid})
+    await log_activity(user['id'], user['name'], 'Delete', 'Product Variants', f"Deleted variant: {doc.get('sku', vid)}")
+    return {'success': True}
+
+# ─── PRODUCTION POs ──────────────────────────────────────────────────────────
+@api.get("/production-pos")
+async def get_pos(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    query = {}
+    search = sp.get('search'); status = sp.get('status')
+    if search: query['$or'] = [{'po_number': {'$regex': search, '$options': 'i'}}, {'customer_name': {'$regex': search, '$options': 'i'}}]
+    if status: query['status'] = status
+    pos = await db.production_pos.find(query, {'_id': 0}).sort('created_at', -1).to_list(None)
+    result = []
+    for po in pos:
+        items = await db.po_items.find({'po_id': po['id']}, {'_id': 0}).to_list(None)
+        serial_numbers = list(set(i.get('serial_number', '') for i in items if i.get('serial_number')))
+        created = po.get('created_at')
+        date_str = ''
+        if created:
+            if isinstance(created, datetime):
+                date_str = created.strftime('%d/%m/%Y')
+            else:
+                date_str = str(created)[:10]
+        composite_label = f"{po.get('po_number', '')} | {po.get('vendor_name', '')} | {date_str}"
+        po_accessories = await db.po_accessories.find({'po_id': po['id']}, {'_id': 0}).to_list(None)
+        result.append({**serialize_doc(po), 'items': serialize_doc(items), 'item_count': len(items),
+                       'total_qty': sum(i.get('qty', 0) for i in items),
+                       'serial_numbers': serial_numbers, 'composite_label': composite_label,
+                       'po_accessories': serialize_doc(po_accessories),
+                       'po_accessories_count': len(po_accessories)})
+    return result
+
+@api.get("/production-pos/{po_id}")
+async def get_po(po_id: str, request: Request):
+    require_auth(request)
+    db = get_db()
+    po = await db.production_pos.find_one({'id': po_id}, {'_id': 0})
+    if not po: raise HTTPException(404, 'Not found')
+    items = await db.po_items.find({'po_id': po_id}, {'_id': 0}).to_list(None)
+    wos = await db.work_orders.find({'po_id': po_id}, {'_id': 0}).to_list(None)
+    po_accessories = await db.po_accessories.find({'po_id': po_id}, {'_id': 0}).sort('created_at', 1).to_list(None)
+    result = serialize_doc(po)
+    result['items'] = serialize_doc(items)
+    result['distributions'] = serialize_doc(wos)
+    result['po_accessories'] = serialize_doc(po_accessories)
+    return result
+
+@api.post("/production-pos")
+async def create_po(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    if not body.get('po_number'): raise HTTPException(400, 'Nomor PO wajib diisi')
+    vendor_name = ''
+    if body.get('vendor_id'):
+        vendor_doc = await db.garments.find_one({'id': body['vendor_id']})
+        vendor_name = vendor_doc.get('garment_name', '') if vendor_doc else ''
+    po_id = new_id()
+    initial_status = 'Confirmed' if body.get('status') == 'Confirmed' else 'Draft'
+    # Resolve buyer name from buyer_id if provided
+    customer_name = body.get('customer_name', '')
+    buyer_id = body.get('buyer_id')
+    if buyer_id:
+        buyer_doc = await db.buyers.find_one({'id': buyer_id})
+        if buyer_doc:
+            customer_name = buyer_doc.get('buyer_name', customer_name)
+    po = {
+        'id': po_id, 'po_number': body['po_number'], 'customer_name': customer_name,
+        'buyer_id': buyer_id,
+        'vendor_id': body.get('vendor_id'), 'vendor_name': vendor_name,
+        'po_date': parse_date(body.get('po_date')) or now(),
+        'deadline': parse_date(body.get('deadline')),
+        'delivery_deadline': parse_date(body.get('delivery_deadline')),
+        'status': initial_status, 'notes': body.get('notes', ''),
+        'created_by': user['name'], 'created_at': now(), 'updated_at': now()
+    }
+    await db.production_pos.insert_one(po)
+    items_data = body.get('items', [])
+    inserted_items = []
+    for item in items_data:
+        variant = await db.product_variants.find_one({'id': item.get('variant_id')}) if item.get('variant_id') else None
+        product = await db.products.find_one({'id': item.get('product_id')}) if item.get('product_id') else None
+        po_item = {
+            'id': new_id(), 'po_id': po_id, 'po_number': body['po_number'],
+            'product_id': item.get('product_id'), 'product_name': (product or {}).get('product_name', ''),
+            'variant_id': item.get('variant_id'), 'size': (variant or {}).get('size', item.get('size', '')),
+            'color': (variant or {}).get('color', item.get('color', '')),
+            'sku': (variant or {}).get('sku', item.get('sku', '')),
+            'qty': int(item.get('qty', 0) or 0), 'serial_number': item.get('serial_number', ''),
+            'selling_price_snapshot': float(item.get('selling_price_snapshot', 0) or (product or {}).get('selling_price', 0) or 0),
+            'cmt_price_snapshot': float(item.get('cmt_price_snapshot', 0) or (product or {}).get('cmt_price', 0) or 0),
+            'created_at': now()
+        }
+        await db.po_items.insert_one(po_item)
+        inserted_items.append(po_item)
+    await log_activity(user['id'], user['name'], 'Create', 'Production PO', f"Created PO: {po['po_number']} with {len(items_data)} items")
+    result = serialize_doc(po)
+    result['items'] = serialize_doc(inserted_items)
+    return JSONResponse(result, status_code=201)
+
+@api.post("/production-pos/{po_id}/close")
+async def close_po(po_id: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    po = await db.production_pos.find_one({'id': po_id})
+    if not po: raise HTTPException(404, 'PO not found')
+    await db.production_pos.update_one({'id': po_id}, {'$set': {
+        'status': 'Closed', 'close_reason': body.get('close_reason'),
+        'close_notes': body.get('close_notes', ''), 'closed_by': user['name'],
+        'closed_at': now(), 'updated_at': now()
+    }})
+    await log_activity(user['id'], user['name'], 'Close PO', 'Production PO', f"Closed PO: {po.get('po_number')}")
+    return {'success': True}
+
+@api.put("/production-pos/{po_id}")
+async def update_po(po_id: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    existing = await db.production_pos.find_one({'id': po_id})
+    if not existing: raise HTTPException(404, 'PO not found')
+    if existing.get('status') == 'Closed' and user.get('role') != 'superadmin':
+        raise HTTPException(403, 'PO ini sudah Closed.')
+    body = await request.json()
+    body.pop('_id', None); body.pop('id', None); body.pop('items', None)
+    if body.get('deadline'): body['deadline'] = parse_date(body['deadline'])
+    if body.get('delivery_deadline'): body['delivery_deadline'] = parse_date(body['delivery_deadline'])
+    if body.get('po_date'): body['po_date'] = parse_date(body['po_date'])
+    if body.get('vendor_id'):
+        vd = await db.garments.find_one({'id': body['vendor_id']})
+        body['vendor_name'] = vd.get('garment_name', '') if vd else ''
+    await db.production_pos.update_one({'id': po_id}, {'$set': {**body, 'updated_at': now()}})
+    await log_activity(user['id'], user['name'], 'Update', 'Production PO', f"Updated PO: {existing.get('po_number')}")
+    return serialize_doc(await db.production_pos.find_one({'id': po_id}, {'_id': 0}))
+
+@api.delete("/production-pos/{po_id}")
+async def delete_po(po_id: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    doc = await db.production_pos.find_one({'id': po_id})
+    if not doc: raise HTTPException(404, 'Not found')
+    await cascade_delete_po(po_id)
+    await log_activity(user['id'], user['name'], 'Delete', 'Production PO', f"Cascade deleted PO: {doc.get('po_number')}")
+    return {'success': True}
+
+# ─── PO ITEMS ────────────────────────────────────────────────────────────────
+@api.get("/po-items")
+async def get_po_items(request: Request):
+    require_auth(request)
+    db = get_db()
+    query = {}
+    po_id = request.query_params.get('po_id')
+    if po_id: query['po_id'] = po_id
+    return serialize_doc(await db.po_items.find(query, {'_id': 0}).sort('created_at', 1).to_list(None))
+
+@api.get("/po-items-produced")
+async def get_po_items_produced(request: Request):
+    require_auth(request)
+    db = get_db()
+    po_id = request.query_params.get('po_id')
+    if not po_id: raise HTTPException(400, 'po_id wajib diisi')
+    po_items = await db.po_items.find({'po_id': po_id}, {'_id': 0}).sort('created_at', 1).to_list(None)
+    enriched = []
+    for item in po_items:
+        job_items = await db.production_job_items.find({'po_item_id': item['id']}).to_list(None)
+        total_produced = 0
+        for ji in job_items:
+            total_produced += ji.get('produced_qty', 0)
+            parent_job = await db.production_jobs.find_one({'id': ji.get('job_id')})
+            if parent_job:
+                child_jobs = await db.production_jobs.find({'parent_job_id': parent_job['id']}).to_list(None)
+                for cj in child_jobs:
+                    cji = await db.production_job_items.find_one({'job_id': cj['id'], 'po_item_id': item['id']})
+                    if cji: total_produced += cji.get('produced_qty', 0)
+        return_items = await db.production_return_items.find({'po_item_id': item['id']}).to_list(None)
+        total_returned = sum(r.get('return_qty', 0) for r in return_items)
+        buyer_items = await db.buyer_shipment_items.find({'po_item_id': item['id']}).to_list(None)
+        total_shipped = sum(b.get('qty_shipped', 0) for b in buyer_items)
+        enriched.append({**serialize_doc(item),
+            'total_produced': total_produced, 'total_shipped': total_shipped,
+            'total_returned': total_returned,
+            'max_returnable': max(0, total_shipped - total_returned)})
+    return enriched
+
+@api.put("/po-items/{item_id}")
+async def update_po_item(item_id: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    body.pop('_id', None); body.pop('id', None)
+    await db.po_items.update_one({'id': item_id}, {'$set': {**body, 'updated_at': now()}})
+    return serialize_doc(await db.po_items.find_one({'id': item_id}, {'_id': 0}))
+
+@api.delete("/po-items/{item_id}")
+async def delete_po_item(item_id: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    await db.po_items.delete_one({'id': item_id})
+    return {'success': True}
+
+# ─── VENDOR SHIPMENTS ────────────────────────────────────────────────────────
+@api.get("/vendor-shipments")
+async def get_vendor_shipments(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    query = {}
+    if user.get('role') == 'vendor': query['vendor_id'] = user.get('vendor_id')
+    shipments = await db.vendor_shipments.find(query, {'_id': 0}).sort('created_at', -1).to_list(None)
+    result = []
+    for s in shipments:
+        items = await db.vendor_shipment_items.find({'shipment_id': s['id']}, {'_id': 0}).to_list(None)
+        child_ships = await db.vendor_shipments.count_documents({'parent_shipment_id': s['id']})
+        # Collect PO accessories
+        po_ids = set()
+        if s.get('po_id'): po_ids.add(s['po_id'])
+        for item in items:
+            if item.get('po_id'): po_ids.add(item['po_id'])
+        po_acc_count = 0
+        for pid in po_ids:
+            po_acc_count += await db.po_accessories.count_documents({'po_id': pid})
+        result.append({**serialize_doc(s), 'items': serialize_doc(items),
+                       'child_shipment_count': child_ships, 'has_children': child_ships > 0,
+                       'po_accessories_count': po_acc_count})
+    return result
+
+@api.get("/vendor-shipments/{sid}")
+async def get_vendor_shipment(sid: str, request: Request):
+    require_auth(request)
+    db = get_db()
+    s = await db.vendor_shipments.find_one({'id': sid}, {'_id': 0})
+    if not s: raise HTTPException(404, 'Not found')
+    items = await db.vendor_shipment_items.find({'shipment_id': sid}, {'_id': 0}).to_list(None)
+    child_ships = await db.vendor_shipments.find({'parent_shipment_id': sid}, {'_id': 0}).to_list(None)
+    child_with_items = []
+    for cs in child_ships:
+        cs_items = await db.vendor_shipment_items.find({'shipment_id': cs['id']}, {'_id': 0}).to_list(None)
+        child_with_items.append({**serialize_doc(cs), 'items': serialize_doc(cs_items)})
+    # Collect PO accessories from linked POs
+    po_ids = set()
+    if s.get('po_id'): po_ids.add(s['po_id'])
+    for item in items:
+        if item.get('po_id'): po_ids.add(item['po_id'])
+    po_accessories_all = []
+    po_info_map = {}
+    for pid in po_ids:
+        accs = await db.po_accessories.find({'po_id': pid}, {'_id': 0}).to_list(None)
+        po_doc = await db.production_pos.find_one({'id': pid}, {'_id': 0})
+        po_number = po_doc.get('po_number', '') if po_doc else ''
+        for acc in accs:
+            acc['po_number'] = po_number
+            po_accessories_all.append(acc)
+        po_info_map[pid] = po_number
+    result = serialize_doc(s)
+    result['items'] = serialize_doc(items)
+    result['child_shipments'] = child_with_items
+    result['po_accessories'] = serialize_doc(po_accessories_all)
+    return result
+
+@api.post("/vendor-shipments")
+async def create_vendor_shipment(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    vendor = await db.garments.find_one({'id': body.get('vendor_id')})
+    if not vendor: raise HTTPException(404, 'Vendor not found')
+    dup = await db.vendor_shipments.find_one({'shipment_number': body.get('shipment_number')})
+    if dup: raise HTTPException(400, f'Nomor shipment "{body.get("shipment_number")}" sudah digunakan')
+    items_data = body.get('items', [])
+    # Derive po_id and po_number from items if all items reference the same PO
+    shipment_po_id = body.get('po_id', '')
+    shipment_po_number = body.get('po_number', '')
+    if not shipment_po_id and items_data:
+        po_ids_in_items = list(set(i.get('po_id') for i in items_data if i.get('po_id')))
+        if len(po_ids_in_items) == 1:
+            shipment_po_id = po_ids_in_items[0]
+            po_doc = await db.production_pos.find_one({'id': shipment_po_id}, {'_id': 0})
+            shipment_po_number = po_doc.get('po_number', '') if po_doc else ''
+    for item in items_data:
+        if item.get('po_id'):
+            po = await db.production_pos.find_one({'id': item['po_id']})
+            if po and po.get('vendor_id') and po['vendor_id'] != body['vendor_id']:
+                raise HTTPException(400, f"PO {po.get('po_number')} ditujukan untuk vendor lain")
+    shipment_id = new_id()
+    shipment = {
+        'id': shipment_id, 'shipment_number': body.get('shipment_number'),
+        'delivery_note_number': body.get('delivery_note_number', ''),
+        'vendor_id': body['vendor_id'], 'vendor_name': vendor.get('garment_name', ''),
+        'po_id': shipment_po_id, 'po_number': shipment_po_number,
+        'shipment_date': parse_date(body.get('shipment_date')) or now(),
+        'shipment_type': body.get('shipment_type', 'NORMAL'),
+        'parent_shipment_id': body.get('parent_shipment_id'),
+        'status': 'Sent', 'notes': body.get('notes', ''),
+        'created_by': user['name'], 'created_at': now(), 'updated_at': now()
+    }
+    await db.vendor_shipments.insert_one(shipment)
+    inserted_items = []
+    affected_pos = set()
+    for item in items_data:
+        po_item = await db.po_items.find_one({'id': item.get('po_item_id')}) if item.get('po_item_id') else None
+        si = {
+            'id': new_id(), 'shipment_id': shipment_id, 'shipment_number': body.get('shipment_number'),
+            'po_id': item.get('po_id'), 'po_number': item.get('po_number'),
+            'po_item_id': item.get('po_item_id'),
+            'source_po_item_id': item.get('po_item_id'),
+            'product_name': (po_item or {}).get('product_name', item.get('product_name', '')),
+            'serial_number': (po_item or {}).get('serial_number', item.get('serial_number', '')),
+            'size': (po_item or {}).get('size', item.get('size', '')),
+            'color': (po_item or {}).get('color', item.get('color', '')),
+            'sku': (po_item or {}).get('sku', item.get('sku', '')),
+            'qty_sent': int(item.get('qty_sent', 0) or 0),
+            'ordered_qty': (po_item or {}).get('qty', int(item.get('ordered_qty', 0) or 0)),
+            'shipment_type': body.get('shipment_type', 'NORMAL'),
+            'parent_shipment_id': body.get('parent_shipment_id'),
+            'created_at': now()
+        }
+        await db.vendor_shipment_items.insert_one(si)
+        inserted_items.append(si)
+        if item.get('po_id'): affected_pos.add(item['po_id'])
+    for pid in affected_pos:
+        po = await db.production_pos.find_one({'id': pid})
+        if po and po.get('status') == 'Draft':
+            await db.production_pos.update_one({'id': pid}, {'$set': {'status': 'Distributed', 'updated_at': now()}})
+    await log_activity(user['id'], user['name'], 'Create', 'Vendor Shipment', f"Created shipment {body.get('shipment_number')}")
+    result = serialize_doc(shipment)
+    result['items'] = serialize_doc(inserted_items)
+    return JSONResponse(result, status_code=201)
+
+@api.put("/vendor-shipments/{sid}")
+async def update_vendor_shipment(sid: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin', 'vendor']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    body.pop('_id', None); body.pop('id', None); body.pop('items', None)
+    await db.vendor_shipments.update_one({'id': sid}, {'$set': {**body, 'updated_at': now()}})
+    await log_activity(user['id'], user['name'], 'Update', 'Vendor Shipment', f"Updated shipment: {sid}")
+    return serialize_doc(await db.vendor_shipments.find_one({'id': sid}, {'_id': 0}))
+
+@api.delete("/vendor-shipments/{sid}")
+async def delete_vendor_shipment(sid: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    doc = await db.vendor_shipments.find_one({'id': sid})
+    if not doc: raise HTTPException(404, 'Not found')
+    inspections = await db.vendor_material_inspections.find({'shipment_id': sid}).to_list(None)
+    for insp in inspections:
+        await db.vendor_material_inspection_items.delete_many({'inspection_id': insp['id']})
+    await db.vendor_material_inspections.delete_many({'shipment_id': sid})
+    jobs = await db.production_jobs.find({'vendor_shipment_id': sid}).to_list(None)
+    for job in jobs:
+        child_jobs = await db.production_jobs.find({'parent_job_id': job['id']}).to_list(None)
+        for cj in child_jobs:
+            await db.production_job_items.delete_many({'job_id': cj['id']})
+            await db.production_progress.delete_many({'job_id': cj['id']})
+            await db.production_jobs.delete_one({'id': cj['id']})
+        await db.production_job_items.delete_many({'job_id': job['id']})
+        await db.production_progress.delete_many({'job_id': job['id']})
+        await db.production_jobs.delete_one({'id': job['id']})
+    await db.material_requests.delete_many({'original_shipment_id': sid})
+    child_ships = await db.vendor_shipments.find({'parent_shipment_id': sid}).to_list(None)
+    for cs in child_ships:
+        await db.vendor_shipment_items.delete_many({'shipment_id': cs['id']})
+        await db.vendor_shipments.delete_one({'id': cs['id']})
+    await db.vendor_shipment_items.delete_many({'shipment_id': sid})
+    await db.vendor_shipments.delete_one({'id': sid})
+    await log_activity(user['id'], user['name'], 'Delete', 'Vendor Shipment', f"Cascade deleted shipment: {doc.get('shipment_number')}")
+    return {'success': True}
+
+# ─── VENDOR MATERIAL INSPECTIONS ─────────────────────────────────────────────
+@api.get("/vendor-material-inspections")
+async def get_inspections(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    query = {}
+    sp = request.query_params
+    if user.get('role') == 'vendor': query['vendor_id'] = user.get('vendor_id')
+    if sp.get('vendor_id'): query['vendor_id'] = sp['vendor_id']
+    if sp.get('shipment_id'): query['shipment_id'] = sp['shipment_id']
+    inspections = await db.vendor_material_inspections.find(query, {'_id': 0}).sort('created_at', -1).to_list(None)
+    result = []
+    for insp in inspections:
+        shipment = await db.vendor_shipments.find_one({'id': insp.get('shipment_id')}) if insp.get('shipment_id') else None
+        items = await db.vendor_material_inspection_items.find({'inspection_id': insp['id']}, {'_id': 0}).to_list(None)
+        result.append({**serialize_doc(insp), 'shipment_number': (shipment or {}).get('shipment_number', ''), 'items': serialize_doc(items)})
+    return result
+
+@api.post("/vendor-material-inspections")
+async def create_inspection(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
+    if not vendor_id: raise HTTPException(400, 'vendor_id diperlukan')
+    shipment = await db.vendor_shipments.find_one({'id': body.get('shipment_id')}) if body.get('shipment_id') else None
+    if not shipment: raise HTTPException(404, 'Shipment tidak ditemukan')
+    existing = await db.vendor_material_inspections.find_one({'shipment_id': body['shipment_id']})
+    if existing: raise HTTPException(400, 'Inspeksi untuk shipment ini sudah dilakukan')
+    inspection_id = new_id()
+    items_data = body.get('items', [])
+    total_received = sum(int(i.get('received_qty', 0) or 0) for i in items_data)
+    total_missing = sum(int(i.get('missing_qty', 0) or 0) for i in items_data)
+    inspection = {
+        'id': inspection_id, 'shipment_id': body['shipment_id'],
+        'shipment_number': shipment.get('shipment_number', ''),
+        'vendor_id': vendor_id, 'vendor_name': shipment.get('vendor_name', ''),
+        'inspection_date': parse_date(body.get('inspection_date')) or now(),
+        'total_received': total_received, 'total_missing': total_missing,
+        'overall_notes': body.get('overall_notes', ''), 'status': 'Submitted',
+        'submitted_by': user['name'], 'created_at': now(), 'updated_at': now()
+    }
+    await db.vendor_material_inspections.insert_one(inspection)
+    for item in items_data:
+        await db.vendor_material_inspection_items.insert_one({
+            'id': new_id(), 'inspection_id': inspection_id,
+            'shipment_item_id': item.get('shipment_item_id'),
+            'sku': item.get('sku', ''), 'product_name': item.get('product_name', ''),
+            'size': item.get('size', ''), 'color': item.get('color', ''),
+            'ordered_qty': int(item.get('ordered_qty', 0) or 0),
+            'received_qty': int(item.get('received_qty', 0) or 0),
+            'missing_qty': int(item.get('missing_qty', 0) or 0),
+            'condition_notes': item.get('condition_notes', ''), 'created_at': now()
+        })
+    # Update shipment
+    await db.vendor_shipments.update_one({'id': body['shipment_id']}, {'$set': {
+        'inspection_status': 'Inspected', 'total_received': total_received,
+        'total_missing': total_missing, 'inspected_at': now(), 'updated_at': now()
+    }})
+    # Auto-create child job for additional/replacement shipment
+    if shipment.get('parent_shipment_id') and shipment.get('status') == 'Received':
+        parent_job = await db.production_jobs.find_one({'vendor_shipment_id': shipment['parent_shipment_id']})
+        already_exists = await db.production_jobs.find_one({'vendor_shipment_id': body['shipment_id']})
+        if parent_job and not already_exists and total_received > 0:
+            child_job_id = new_id()
+            suffix = 'A' if shipment.get('shipment_type') == 'ADDITIONAL' else 'R'
+            child_count = await db.production_jobs.count_documents({'parent_job_id': parent_job['id']})
+            child_job_number = f"{parent_job['job_number']}-{suffix}{child_count + 1}"
+            child_job = {
+                'id': child_job_id, 'job_number': child_job_number,
+                'parent_job_id': parent_job['id'], 'parent_job_number': parent_job['job_number'],
+                'vendor_id': parent_job['vendor_id'], 'vendor_name': parent_job['vendor_name'],
+                'po_id': parent_job.get('po_id'), 'po_number': parent_job.get('po_number', ''),
+                'customer_name': parent_job.get('customer_name', ''),
+                'vendor_shipment_id': body['shipment_id'],
+                'shipment_number': shipment.get('shipment_number'),
+                'shipment_type': shipment.get('shipment_type', 'ADDITIONAL'),
+                'deadline': parent_job.get('deadline'), 'delivery_deadline': parent_job.get('delivery_deadline'),
+                'status': 'In Progress', 'notes': f"Auto-created from {shipment.get('shipment_type')} shipment",
+                'created_by': 'system', 'created_at': now(), 'updated_at': now()
+            }
+            await db.production_jobs.insert_one(child_job)
+            ship_items = await db.vendor_shipment_items.find({'shipment_id': body['shipment_id']}).to_list(None)
+            for si in ship_items:
+                po_item = await db.po_items.find_one({'id': si.get('po_item_id')}) if si.get('po_item_id') else None
+                matched = next((ii for ii in items_data if ii.get('shipment_item_id') == si['id']), None)
+                if not matched:
+                    matched = next((ii for ii in items_data if ii.get('sku') == si.get('sku') and ii.get('size') == si.get('size', '')), None)
+                avail = int(matched.get('received_qty', 0)) if matched else si.get('qty_sent', 0)
+                await db.production_job_items.insert_one({
+                    'id': new_id(), 'job_id': child_job_id, 'job_number': child_job_number,
+                    'po_item_id': si.get('po_item_id'),
+                    'vendor_shipment_item_id': si['id'],
+                    'product_name': si.get('product_name', ''), 'sku': si.get('sku', ''),
+                    'size': si.get('size', ''), 'color': si.get('color', ''),
+                    'serial_number': (po_item or {}).get('serial_number', si.get('serial_number', '')),
+                    'ordered_qty': si.get('qty_sent', 0), 'shipment_qty': si.get('qty_sent', 0),
+                    'available_qty': avail, 'produced_qty': 0, 'created_at': now()
+                })
+    await log_activity(user['id'], user['name'], 'Create', 'Material Inspection',
+                       f"Inspeksi shipment {shipment.get('shipment_number')}: diterima {total_received}, missing {total_missing}")
+    item_docs = await db.vendor_material_inspection_items.find({'inspection_id': inspection_id}, {'_id': 0}).to_list(None)
+    result = serialize_doc(inspection)
+    result['items'] = serialize_doc(item_docs)
+    return JSONResponse(result, status_code=201)
+
+# ─── PRODUCTION JOBS ─────────────────────────────────────────────────────────
+@api.get("/production-jobs")
+async def get_jobs(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    filt = {}
+    if user.get('role') == 'vendor': filt['vendor_id'] = user.get('vendor_id')
+    if sp.get('vendor_id'): filt['vendor_id'] = sp['vendor_id']
+    if sp.get('include_children') != 'true':
+        filt['parent_job_id'] = {'$in': [None, '', False]}
+    jobs = await db.production_jobs.find(filt, {'_id': 0}).sort('created_at', -1).to_list(None)
+    # Also include jobs where parent_job_id doesn't exist
+    if sp.get('include_children') != 'true':
+        extra = await db.production_jobs.find({**{k:v for k,v in filt.items() if k != 'parent_job_id'}, 'parent_job_id': {'$exists': False}}, {'_id': 0}).sort('created_at', -1).to_list(None)
+        existing_ids = {j['id'] for j in jobs}
+        for e in extra:
+            if e['id'] not in existing_ids:
+                jobs.append(e)
+    result = []
+    for j in jobs:
+        items = await db.production_job_items.find({'job_id': j['id']}, {'_id': 0}).to_list(None)
+        child_jobs = await db.production_jobs.find({'parent_job_id': j['id']}, {'_id': 0}).to_list(None)
+        total_ordered = sum(i.get('ordered_qty', 0) for i in items)
+        total_available = sum(i.get('available_qty', i.get('shipment_qty', 0)) for i in items)
+        total_produced = sum(i.get('produced_qty', 0) for i in items)
+        for child in child_jobs:
+            ci = await db.production_job_items.find({'job_id': child['id']}).to_list(None)
+            total_available += sum(i.get('available_qty', i.get('shipment_qty', 0)) for i in ci)
+            total_produced += sum(i.get('produced_qty', 0) for i in ci)
+        serial_numbers = list(set(i.get('serial_number', '') for i in items if i.get('serial_number')))
+        result.append({**serialize_doc(j), 'item_count': len(items),
+                       'total_ordered': total_ordered, 'total_available': total_available,
+                       'total_produced': total_produced,
+                       'progress_pct': round((total_produced / total_available * 100) if total_available > 0 else 0),
+                       'serial_numbers': serial_numbers, 'child_job_count': len(child_jobs),
+                       'child_jobs': [{'id': c['id'], 'job_number': c.get('job_number'), 'status': c.get('status'), 'shipment_type': c.get('shipment_type')} for c in child_jobs]})
+    return result
+
+@api.get("/production-jobs/{jid}")
+async def get_job(jid: str, request: Request):
+    require_auth(request)
+    db = get_db()
+    job = await db.production_jobs.find_one({'id': jid}, {'_id': 0})
+    if not job: raise HTTPException(404, 'Not found')
+    items = await db.production_job_items.find({'job_id': jid}, {'_id': 0}).to_list(None)
+    enriched_items = []
+    for item in items:
+        defects = await db.material_defect_reports.find({'job_item_id': item['id']}).to_list(None)
+        total_defect = sum(d.get('defect_qty', 0) for d in defects)
+        effective_available = max(0, (item.get('available_qty', item.get('shipment_qty', 0))) - total_defect)
+        enriched_items.append({**serialize_doc(item), 'total_defect_qty': total_defect, 'effective_available_qty': effective_available})
+    child_jobs = await db.production_jobs.find({'parent_job_id': jid}, {'_id': 0}).to_list(None)
+    result = serialize_doc(job)
+    result['items'] = enriched_items
+    result['child_jobs'] = serialize_doc(child_jobs)
+    return result
+
+@api.post("/production-jobs")
+async def create_job(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
+    if not vendor_id: raise HTTPException(400, 'vendor_id diperlukan')
+    shipment = await db.vendor_shipments.find_one({'id': body.get('vendor_shipment_id')})
+    if not shipment: raise HTTPException(404, 'Shipment tidak ditemukan')
+    if shipment.get('status') != 'Received': raise HTTPException(400, 'Shipment belum dikonfirmasi diterima.')
+    if shipment.get('vendor_id') != vendor_id: raise HTTPException(403, 'Shipment ini bukan milik vendor Anda')
+    if shipment.get('inspection_status') != 'Inspected':
+        raise HTTPException(400, f"Inspeksi material belum selesai.")
+    existing = await db.production_jobs.find_one({'vendor_shipment_id': body['vendor_shipment_id']})
+    if existing: raise HTTPException(400, f"Production Job sudah ada ({existing.get('job_number')})")
+    parent_job_id = None
+    parent_job_number = None
+    if shipment.get('parent_shipment_id'):
+        parent_job = await db.production_jobs.find_one({'vendor_shipment_id': shipment['parent_shipment_id']})
+        if parent_job:
+            parent_job_id = parent_job['id']
+            parent_job_number = parent_job.get('job_number')
+    ship_items = await db.vendor_shipment_items.find({'shipment_id': body['vendor_shipment_id']}).to_list(None)
+    po_id = body.get('po_id') or (ship_items[0].get('po_id') if ship_items else None)
+    po = await db.production_pos.find_one({'id': po_id}) if po_id else None
+    job_id = new_id()
+    job_seq = (await db.production_jobs.count_documents({})) + 1
+    if parent_job_number:
+        suffix = 'A' if shipment.get('shipment_type') == 'ADDITIONAL' else 'R'
+        child_count = await db.production_jobs.count_documents({'parent_job_id': parent_job_id})
+        job_number = f"{parent_job_number}-{suffix}{child_count + 1}"
+    else:
+        job_number = f"JOB-{str(job_seq).zfill(4)}"
+    job = {
+        'id': job_id, 'job_number': job_number,
+        'parent_job_id': parent_job_id, 'parent_job_number': parent_job_number,
+        'vendor_id': vendor_id, 'vendor_name': shipment.get('vendor_name', ''),
+        'po_id': po_id, 'po_number': (po or {}).get('po_number', ''),
+        'customer_name': (po or {}).get('customer_name', ''),
+        'vendor_shipment_id': body['vendor_shipment_id'],
+        'shipment_number': shipment.get('shipment_number'),
+        'shipment_type': shipment.get('shipment_type', 'NORMAL'),
+        'deadline': (po or {}).get('deadline'), 'delivery_deadline': (po or {}).get('delivery_deadline'),
+        'status': 'In Progress', 'notes': body.get('notes', ''),
+        'created_by': user['name'], 'created_at': now(), 'updated_at': now()
+    }
+    await db.production_jobs.insert_one(job)
+    inspection = await db.vendor_material_inspections.find_one({'shipment_id': body['vendor_shipment_id']})
+    inserted_items = []
+    for si in ship_items:
+        po_item = await db.po_items.find_one({'id': si.get('po_item_id')}) if si.get('po_item_id') else None
+        available_qty = si.get('qty_sent', 0)
+        if inspection:
+            insp_item = await db.vendor_material_inspection_items.find_one({'inspection_id': inspection['id'], 'shipment_item_id': si['id']})
+            if not insp_item:
+                insp_item = await db.vendor_material_inspection_items.find_one({'inspection_id': inspection['id'], 'sku': si.get('sku', ''), 'size': si.get('size', ''), 'color': si.get('color', '')})
+            if insp_item:
+                available_qty = insp_item.get('received_qty', si.get('qty_sent', 0))
+        ji = {
+            'id': new_id(), 'job_id': job_id, 'job_number': job_number,
+            'po_item_id': si.get('po_item_id'),
+            'vendor_shipment_item_id': si['id'],
+            'product_name': si.get('product_name', ''), 'sku': si.get('sku', ''),
+            'size': si.get('size', ''), 'color': si.get('color', ''),
+            'serial_number': (po_item or {}).get('serial_number', si.get('serial_number', '')),
+            'ordered_qty': (po_item or {}).get('qty', si.get('qty_sent', 0)),
+            'shipment_qty': si.get('qty_sent', 0), 'available_qty': available_qty,
+            'produced_qty': 0, 'created_at': now()
+        }
+        await db.production_job_items.insert_one(ji)
+        inserted_items.append(ji)
+    if po_id:
+        current_po = await db.production_pos.find_one({'id': po_id})
+        if current_po and current_po.get('status') not in ['Completed', 'Closed']:
+            await db.production_pos.update_one({'id': po_id}, {'$set': {'status': 'In Production', 'updated_at': now()}})
+    await log_activity(user['id'], user['name'], 'Create', 'Production Job', f"Created job {job_number}")
+    result = serialize_doc(job)
+    result['items'] = serialize_doc(inserted_items)
+    return JSONResponse(result, status_code=201)
+
+@api.delete("/production-jobs/{jid}")
+async def delete_job(jid: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    doc = await db.production_jobs.find_one({'id': jid})
+    if not doc: raise HTTPException(404, 'Not found')
+    child_jobs = await db.production_jobs.find({'parent_job_id': jid}).to_list(None)
+    for cj in child_jobs:
+        await db.production_job_items.delete_many({'job_id': cj['id']})
+        await db.production_progress.delete_many({'job_id': cj['id']})
+        await db.production_jobs.delete_one({'id': cj['id']})
+    await db.production_job_items.delete_many({'job_id': jid})
+    await db.production_progress.delete_many({'job_id': jid})
+    await db.production_jobs.delete_one({'id': jid})
+    await log_activity(user['id'], user['name'], 'Delete', 'Production Job', f"Deleted job: {doc.get('job_number')}")
+    return {'success': True}
+
+# ─── PRODUCTION JOB ITEMS ────────────────────────────────────────────────────
+@api.get("/production-job-items")
+async def get_job_items(request: Request):
+    require_auth(request)
+    db = get_db()
+    job_id = request.query_params.get('job_id')
+    if not job_id: raise HTTPException(400, 'job_id required')
+    items = await db.production_job_items.find({'job_id': job_id}, {'_id': 0}).to_list(None)
+    child_jobs = await db.production_jobs.find({'parent_job_id': job_id}).to_list(None)
+    child_job_ids = [c['id'] for c in child_jobs]
+    child_items_by_poi = {}
+    for cj_id in child_job_ids:
+        ci = await db.production_job_items.find({'job_id': cj_id}).to_list(None)
+        for c in ci:
+            key = c.get('po_item_id') or c['id']
+            if key not in child_items_by_poi: child_items_by_poi[key] = []
+            child_items_by_poi[key].append(c)
+    result = []
+    for item in items:
+        progress = await db.production_progress.find({'job_item_id': item['id']}, {'_id': 0}).sort('progress_date', -1).to_list(None)
+        key = item.get('po_item_id') or item['id']
+        child_items = child_items_by_poi.get(key, [])
+        child_produced = sum(ci.get('produced_qty', 0) for ci in child_items)
+        total_produced = (item.get('produced_qty', 0)) + child_produced
+        all_job_item_ids = [item['id']] + [ci['id'] for ci in child_items]
+        buyer_filter = {'po_item_id': item.get('po_item_id')} if item.get('po_item_id') else {'job_item_id': {'$in': all_job_item_ids}}
+        buyer_items = await db.buyer_shipment_items.find(buyer_filter).to_list(None)
+        shipped = sum(b.get('qty_shipped', 0) for b in buyer_items)
+        result.append({**serialize_doc(item), 'progress_history': serialize_doc(progress),
+                       'shipped_to_buyer': shipped, 'remaining_to_ship': max(0, total_produced - shipped),
+                       'child_produced_qty': child_produced, 'total_produced_qty': total_produced})
+    return result
+
+# ─── PRODUCTION PROGRESS ─────────────────────────────────────────────────────
+@api.get("/production-progress")
+async def get_progress(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    query = {}
+    sp = request.query_params
+    if sp.get('work_order_id'): query['work_order_id'] = sp['work_order_id']
+    if user.get('role') == 'vendor': query['garment_id'] = user.get('vendor_id')
+    return serialize_doc(await db.production_progress.find(query, {'_id': 0}).sort('progress_date', -1).to_list(None))
+
+@api.post("/production-progress")
+async def create_progress(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    if body.get('job_item_id'):
+        job_item = await db.production_job_items.find_one({'id': body['job_item_id']})
+        if not job_item: raise HTTPException(404, 'Job item tidak ditemukan')
+        qty_today = int(body.get('completed_quantity', 0) or 0)
+        if qty_today <= 0: raise HTTPException(400, 'Jumlah produksi harus lebih dari 0')
+        max_qty = job_item.get('available_qty', job_item.get('shipment_qty', 0))
+        new_total = (job_item.get('produced_qty', 0)) + qty_today
+        if new_total > max_qty:
+            raise HTTPException(400, f"Total produksi ({new_total}) melebihi material tersedia ({max_qty} pcs)")
+        progress = {
+            'id': new_id(), 'job_id': job_item.get('job_id'), 'job_item_id': body['job_item_id'],
+            'sku': job_item.get('sku', ''), 'product_name': job_item.get('product_name', ''),
+            'size': job_item.get('size', ''), 'color': job_item.get('color', ''),
+            'progress_date': parse_date(body.get('progress_date')) or now(),
+            'completed_quantity': qty_today, 'notes': body.get('notes', ''),
+            'recorded_by': user['name'], 'created_at': now()
+        }
+        await db.production_progress.insert_one(progress)
+        await db.production_job_items.update_one({'id': body['job_item_id']}, {'$set': {'produced_qty': new_total, 'updated_at': now()}})
+        all_items = await db.production_job_items.find({'job_id': job_item['job_id']}).to_list(None)
+        all_done = all(
+            (new_total if i['id'] == body['job_item_id'] else i.get('produced_qty', 0)) >= i.get('shipment_qty', 0)
+            for i in all_items
+        )
+        if all_done:
+            await db.production_jobs.update_one({'id': job_item['job_id']}, {'$set': {'status': 'Completed', 'updated_at': now()}})
+        await log_activity(user['id'], user['name'], 'Create', 'Production Progress', f"Progress {job_item.get('sku')}: +{qty_today}")
+        result = serialize_doc(progress)
+        result['new_total'] = new_total
+        return JSONResponse(result, status_code=201)
+    # Legacy: work_order_id
+    wo = await db.work_orders.find_one({'id': body.get('work_order_id')})
+    if not wo: raise HTTPException(404, 'Work order tidak ditemukan')
+    progress = {
+        'id': new_id(), 'work_order_id': body['work_order_id'],
+        'distribution_code': wo.get('distribution_code'),
+        'garment_id': wo.get('garment_id'), 'garment_name': wo.get('garment_name'),
+        'po_id': wo.get('po_id'), 'po_number': wo.get('po_number'),
+        'progress_date': parse_date(body.get('progress_date')) or now(),
+        'completed_quantity': int(body.get('completed_quantity', 0)),
+        'notes': body.get('notes', ''), 'recorded_by': user['name'], 'created_at': now()
+    }
+    await db.production_progress.insert_one(progress)
+    all_prog = await db.production_progress.find({'work_order_id': body['work_order_id']}).to_list(None)
+    total_completed = sum(p.get('completed_quantity', 0) for p in all_prog)
+    new_status = 'Completed' if total_completed >= wo.get('quantity', 0) else 'In Progress'
+    await db.work_orders.update_one({'id': body['work_order_id']}, {'$set': {'completed_quantity': total_completed, 'status': new_status, 'updated_at': now()}})
+    await db.production_pos.update_one({'id': wo.get('po_id')}, {'$set': {'status': 'In Production', 'updated_at': now()}})
+    return JSONResponse(serialize_doc(progress), status_code=201)
+
+# ─── BUYER SHIPMENTS ─────────────────────────────────────────────────────────
+@api.get("/buyer-shipments")
+async def get_buyer_shipments(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    query = {}
+    if sp.get('po_id'): query['po_id'] = sp['po_id']
+    if user.get('role') == 'vendor': query['vendor_id'] = user.get('vendor_id')
+    shipments = await db.buyer_shipments.find(query, {'_id': 0}).sort('created_at', -1).to_list(None)
+    result = []
+    for s in shipments:
+        items = await db.buyer_shipment_items.find({'shipment_id': s['id']}, {'_id': 0}).to_list(None)
+        po_item_map = {}
+        for item in items:
+            key = item.get('po_item_id') or item['id']
+            if key not in po_item_map:
+                po_item_map[key] = {'ordered_qty': item.get('ordered_qty', 0), 'shipped': 0}
+            po_item_map[key]['shipped'] += item.get('qty_shipped', 0)
+        total_ordered = sum(v['ordered_qty'] for v in po_item_map.values())
+        total_shipped = sum(v['shipped'] for v in po_item_map.values())
+        remaining = max(0, total_ordered - total_shipped)
+        pct = round((total_shipped / total_ordered * 100)) if total_ordered > 0 else 0
+        max_dispatch = max((i.get('dispatch_seq', 1) for i in items), default=0)
+        result.append({**serialize_doc(s), 'items': serialize_doc(items),
+                       'total_ordered': total_ordered, 'total_shipped': total_shipped,
+                       'remaining': remaining, 'progress_pct': pct, 'dispatch_count': max_dispatch})
+    return result
+
+@api.get("/buyer-shipments/{bsid}")
+async def get_buyer_shipment(bsid: str, request: Request):
+    require_auth(request)
+    db = get_db()
+    s = await db.buyer_shipments.find_one({'id': bsid}, {'_id': 0})
+    if not s: raise HTTPException(404, 'Not found')
+    items = await db.buyer_shipment_items.find({'shipment_id': bsid}, {'_id': 0}).sort([('dispatch_seq', 1), ('created_at', 1)]).to_list(None)
+    dispatch_map = {}
+    poi_totals = {}
+    for item in items:
+        seq = item.get('dispatch_seq', 1)
+        if seq not in dispatch_map:
+            dispatch_map[seq] = {'dispatch_seq': seq, 'dispatch_date': item.get('dispatch_date') or item.get('created_at'), 'items': [], 'total_qty': 0}
+        dispatch_map[seq]['items'].append(serialize_doc(item))
+        dispatch_map[seq]['total_qty'] += item.get('qty_shipped', 0)
+        key = item.get('po_item_id') or item['id']
+        if key not in poi_totals:
+            poi_totals[key] = {'po_item_id': item.get('po_item_id'), 'sku': item.get('sku', ''),
+                               'product_name': item.get('product_name', ''), 'serial_number': item.get('serial_number', ''),
+                               'size': item.get('size', ''), 'color': item.get('color', ''),
+                               'ordered_qty': item.get('ordered_qty', 0), 'cumulative_shipped': 0}
+        poi_totals[key]['cumulative_shipped'] += item.get('qty_shipped', 0)
+    dispatches = sorted(dispatch_map.values(), key=lambda d: d['dispatch_seq'])
+    summary_items = list(poi_totals.values())
+    total_ordered = sum(i['ordered_qty'] for i in summary_items)
+    total_shipped = sum(i['cumulative_shipped'] for i in summary_items)
+    remaining = max(0, total_ordered - total_shipped)
+    pct = round((total_shipped / total_ordered * 100)) if total_ordered > 0 else 0
+    result = serialize_doc(s)
+    result.update({'items': serialize_doc(items), 'dispatches': dispatches,
+                   'summary_items': summary_items, 'total_ordered': total_ordered,
+                   'total_shipped': total_shipped, 'remaining': remaining, 'progress_pct': pct})
+    return result
+
+@api.post("/buyer-shipments")
+async def create_buyer_shipment(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
+    vendor_doc = await db.garments.find_one({'id': vendor_id}) if vendor_id else None
+    po = await db.production_pos.find_one({'id': body.get('po_id')}) if body.get('po_id') else None
+    job_id = body.get('job_id')
+    master_shipment = None
+    if job_id:
+        master_shipment = await db.buyer_shipments.find_one({'job_id': job_id, 'vendor_id': vendor_id})
+    is_new = not master_shipment
+    if is_new:
+        shipment_id = new_id()
+        master_shipment = {
+            'id': shipment_id, 'shipment_number': body.get('shipment_number', f"BS-{int(datetime.now().timestamp())}"),
+            'vendor_id': vendor_id, 'vendor_name': (vendor_doc or {}).get('garment_name', user['name']),
+            'po_id': body.get('po_id'), 'po_number': (po or {}).get('po_number', body.get('po_number', '')),
+            'customer_name': (po or {}).get('customer_name', body.get('customer_name', '')),
+            'job_id': job_id, 'ship_status': 'Pending', 'notes': body.get('notes', ''),
+            'created_by': user['name'], 'created_at': now(), 'updated_at': now()
+        }
+        await db.buyer_shipments.insert_one(master_shipment)
+    else:
+        shipment_id = master_shipment['id']
+    existing_items = await db.buyer_shipment_items.find({'shipment_id': shipment_id}).to_list(None)
+    max_dispatch = max((i.get('dispatch_seq', 1) for i in existing_items), default=0)
+    dispatch_seq = max_dispatch + 1
+    dispatch_date = parse_date(body.get('shipment_date')) or now()
+    items_data = body.get('items', [])
+    inserted_items = []
+    for item in items_data:
+        po_item = await db.po_items.find_one({'id': item.get('po_item_id')}) if item.get('po_item_id') else None
+        si = {
+            'id': new_id(), 'shipment_id': shipment_id,
+            'dispatch_seq': dispatch_seq, 'dispatch_date': dispatch_date,
+            'po_item_id': item.get('po_item_id'), 'job_item_id': item.get('job_item_id'),
+            'product_name': (po_item or {}).get('product_name', item.get('product_name', '')),
+            'serial_number': (po_item or {}).get('serial_number', item.get('serial_number', '')),
+            'size': (po_item or {}).get('size', item.get('size', '')),
+            'color': (po_item or {}).get('color', item.get('color', '')),
+            'sku': (po_item or {}).get('sku', item.get('sku', '')),
+            'ordered_qty': int(item.get('ordered_qty', 0) or 0),
+            'qty_shipped': int(item.get('qty_shipped', 0) or 0), 'created_at': now()
+        }
+        await db.buyer_shipment_items.insert_one(si)
+        inserted_items.append(si)
+    all_items = await db.buyer_shipment_items.find({'shipment_id': shipment_id}).to_list(None)
+    any_shipped = any(i.get('qty_shipped', 0) > 0 for i in all_items)
+    ship_status = 'Partially Shipped' if any_shipped else 'Pending'
+    await db.buyer_shipments.update_one({'id': shipment_id}, {'$set': {
+        'ship_status': ship_status, 'last_dispatch': dispatch_date,
+        'last_dispatch_seq': dispatch_seq, 'updated_at': now()
+    }})
+    await log_activity(user['id'], user['name'], 'Create' if is_new else 'Add Dispatch', 'Buyer Shipment', f"Buyer shipment - {ship_status}")
+    result = serialize_doc(master_shipment)
+    result.update({'ship_status': ship_status, 'dispatch_seq': dispatch_seq, 'is_new': is_new, 'items': serialize_doc(inserted_items)})
+    return JSONResponse(result, status_code=201 if is_new else 200)
+
+@api.put("/buyer-shipments/{bsid}")
+async def update_buyer_shipment(bsid: str, request: Request):
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    body.pop('_id', None); body.pop('id', None); body.pop('items', None)
+    await db.buyer_shipments.update_one({'id': bsid}, {'$set': {**body, 'updated_at': now()}})
+    return serialize_doc(await db.buyer_shipments.find_one({'id': bsid}, {'_id': 0}))
+
+@api.delete("/buyer-shipments/{bsid}")
+async def delete_buyer_shipment(bsid: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    doc = await db.buyer_shipments.find_one({'id': bsid})
+    if not doc: raise HTTPException(404, 'Not found')
+    await db.buyer_shipment_items.delete_many({'shipment_id': bsid})
+    await db.buyer_shipments.delete_one({'id': bsid})
+    return {'success': True}
+
+@api.get("/buyer-shipment-dispatches")
+async def get_dispatches(request: Request):
+    require_auth(request)
+    db = get_db()
+    sid = request.query_params.get('shipment_id')
+    if not sid: raise HTTPException(400, 'shipment_id required')
+    items = await db.buyer_shipment_items.find({'shipment_id': sid}, {'_id': 0}).sort([('dispatch_seq', 1), ('created_at', 1)]).to_list(None)
+    dm = {}
+    for item in items:
+        seq = item.get('dispatch_seq', 1)
+        if seq not in dm:
+            dm[seq] = {'dispatch_seq': seq, 'dispatch_date': item.get('dispatch_date') or item.get('created_at'), 'items': [], 'total_qty': 0}
+        dm[seq]['items'].append(serialize_doc(item))
+        dm[seq]['total_qty'] += item.get('qty_shipped', 0)
+    return sorted(dm.values(), key=lambda d: d['dispatch_seq'])
+
+# ─── INVOICES ────────────────────────────────────────────────────────────────
+@api.get("/invoices")
+async def get_invoices(request: Request):
+    require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    query = {}
+    if sp.get('status'): query['status'] = sp['status']
+    if sp.get('garment_id'): query['garment_id'] = sp['garment_id']
+    if sp.get('type') == 'vendor': query['invoice_category'] = 'VENDOR'
+    elif sp.get('type') == 'customer': query['invoice_category'] = 'BUYER'
+    if sp.get('category'): query['invoice_category'] = sp['category']
+    if sp.get('invoice_type'): query['invoice_type'] = sp['invoice_type']
+    if sp.get('date_from') or sp.get('date_to'):
+        query['created_at'] = {}
+        if sp.get('date_from'): query['created_at']['$gte'] = parse_date(sp['date_from'])
+        if sp.get('date_to'): query['created_at']['$lte'] = to_end_of_day(sp['date_to'])
+    return serialize_doc(await db.invoices.find(query, {'_id': 0}).sort('created_at', -1).to_list(None))
+
+@api.get("/invoices/{inv_id}")
+async def get_invoice(inv_id: str, request: Request):
+    require_auth(request)
+    db = get_db()
+    inv = await db.invoices.find_one({'id': inv_id}, {'_id': 0})
+    if not inv: raise HTTPException(404, 'Not found')
+    payments = await db.payments.find({'invoice_id': inv_id}, {'_id': 0}).to_list(None)
+    adjustments = await db.invoice_adjustments.find({'invoice_id': inv_id}, {'_id': 0}).sort('created_at', -1).to_list(None)
+    total_add = sum(a.get('amount', 0) for a in adjustments if a.get('adjustment_type') == 'ADD')
+    total_deduct = sum(a.get('amount', 0) for a in adjustments if a.get('adjustment_type') == 'DEDUCT')
+    base_amount = inv.get('base_amount', inv.get('total_amount', 0))
+    adjusted_total = base_amount + total_add - total_deduct
+    result = serialize_doc(inv)
+    result.update({'payments': serialize_doc(payments), 'adjustments': serialize_doc(adjustments),
+                   'base_amount': base_amount, 'adjusted_total': adjusted_total})
+    return result
+
+@api.post("/invoices")
+async def create_invoice(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin', 'finance']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    po_id = body.get('source_po_id')
+    if not po_id: raise HTTPException(400, 'source_po_id wajib diisi')
+    po = await db.production_pos.find_one({'id': po_id})
+    if not po: raise HTTPException(404, 'PO tidak ditemukan')
+    category = body.get('invoice_category')
+    if category not in ['VENDOR', 'BUYER']: raise HTTPException(400, 'invoice_category harus VENDOR atau BUYER')
+    inv_seq = (await db.invoices.count_documents({})) + 1
+    prefix = 'MVINV' if category == 'VENDOR' else 'MBINV'
+    inv_number = f"{prefix}{str(inv_seq).zfill(5)}"
+    items = body.get('invoice_items', [])
+    recalc_items = []
+    for it in items:
+        price = it.get('cmt_price', 0) if category == 'VENDOR' else it.get('selling_price', 0)
+        qty = it.get('invoice_qty', it.get('qty', 0))
+        recalc_items.append({**it, 'invoice_qty': qty, 'subtotal': qty * price})
+    total_amount = sum(i['subtotal'] for i in recalc_items) - float(body.get('discount', 0) or 0)
+    invoice = {
+        'id': new_id(), 'invoice_number': inv_number, 'invoice_type': 'MANUAL',
+        'invoice_category': category, 'source_po_id': po_id, 'po_number': po.get('po_number'),
+        'vendor_or_customer_id': po.get('vendor_id') if category == 'VENDOR' else None,
+        'vendor_or_customer_name': po.get('vendor_name', '') if category == 'VENDOR' else po.get('customer_name', ''),
+        'garment_id': po.get('vendor_id'), 'garment_name': po.get('vendor_name', ''),
+        'vendor_id': po.get('vendor_id'), 'vendor_name': po.get('vendor_name', ''),
+        'customer_name': po.get('customer_name', ''),
+        'invoice_items': recalc_items, 'total_amount': total_amount,
+        'paid_amount': 0, 'total_paid': 0, 'remaining_balance': total_amount,
+        'status': 'Unpaid', 'revision_number': 0,
+        'discount': float(body.get('discount', 0) or 0), 'notes': body.get('notes', ''),
+        'created_by': user['name'], 'created_at': now(), 'updated_at': now()
+    }
+    await db.invoices.insert_one(invoice)
+    await log_activity(user['id'], user['name'], 'Create Manual Invoice', 'Invoice', f"Manual {category} invoice {inv_number}")
+    return JSONResponse(serialize_doc(invoice), status_code=201)
+
+@api.put("/invoices/{inv_id}")
+async def update_invoice(inv_id: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin', 'finance']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    body.pop('_id', None); body.pop('id', None)
+    await db.invoices.update_one({'id': inv_id}, {'$set': {**body, 'updated_at': now()}})
+    return serialize_doc(await db.invoices.find_one({'id': inv_id}, {'_id': 0}))
+
+@api.delete("/invoices/{inv_id}")
+async def delete_invoice(inv_id: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    doc = await db.invoices.find_one({'id': inv_id})
+    if not doc: raise HTTPException(404, 'Not found')
+    await db.payments.delete_many({'invoice_id': inv_id})
+    await db.invoice_adjustments.delete_many({'invoice_id': inv_id})
+    await db.invoices.delete_one({'id': inv_id})
+    return {'success': True}
+
+# ─── INVOICE ADJUSTMENTS ─────────────────────────────────────────────────────
+@api.get("/invoice-adjustments")
+async def get_adjustments(request: Request):
+    require_auth(request)
+    db = get_db()
+    inv_id = request.query_params.get('invoice_id')
+    if not inv_id: raise HTTPException(400, 'invoice_id required')
+    return serialize_doc(await db.invoice_adjustments.find({'invoice_id': inv_id}, {'_id': 0}).sort('created_at', -1).to_list(None))
+
+@api.post("/invoice-adjustments")
+async def create_adjustment(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin', 'finance', 'superadmin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    if not body.get('invoice_id'): raise HTTPException(400, 'invoice_id wajib diisi')
+    if body.get('adjustment_type') not in ['ADD', 'DEDUCT']: raise HTTPException(400, 'adjustment_type harus ADD atau DEDUCT')
+    if not body.get('amount') or float(body['amount']) <= 0: raise HTTPException(400, 'amount harus lebih dari 0')
+    if not body.get('reason'): raise HTTPException(400, 'reason wajib diisi')
+    invoice = await db.invoices.find_one({'id': body['invoice_id']})
+    if not invoice: raise HTTPException(404, 'Invoice not found')
+    adjustment = {
+        'id': new_id(), 'invoice_id': body['invoice_id'],
+        'invoice_number': invoice.get('invoice_number'),
+        'adjustment_type': body['adjustment_type'], 'amount': float(body['amount']),
+        'reason': body.get('reason', ''), 'notes': body.get('notes', ''),
+        'reference_event': body.get('reference_event', ''),
+        'created_by': user['name'], 'created_at': now()
+    }
+    await db.invoice_adjustments.insert_one(adjustment)
+    all_adj = await db.invoice_adjustments.find({'invoice_id': body['invoice_id']}).to_list(None)
+    total_add = sum(a.get('amount', 0) for a in all_adj if a.get('adjustment_type') == 'ADD')
+    total_deduct = sum(a.get('amount', 0) for a in all_adj if a.get('adjustment_type') == 'DEDUCT')
+    base_amount = invoice.get('base_amount', invoice.get('total_amount', 0))
+    new_total = base_amount + total_add - total_deduct
+    new_status = 'Paid' if (invoice.get('total_paid', 0)) >= new_total else ('Partial' if (invoice.get('total_paid', 0)) > 0 else 'Unpaid')
+    await db.invoices.update_one({'id': body['invoice_id']}, {'$set': {
+        'base_amount': base_amount, 'total_amount': new_total,
+        'remaining_balance': new_total - (invoice.get('total_paid', 0)),
+        'status': new_status, 'updated_at': now()
+    }})
+    return JSONResponse(serialize_doc(adjustment), status_code=201)
+
+@api.delete("/invoice-adjustments/{adj_id}")
+async def delete_adjustment(adj_id: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    doc = await db.invoice_adjustments.find_one({'id': adj_id})
+    if not doc: raise HTTPException(404, 'Not found')
+    await db.invoice_adjustments.delete_one({'id': adj_id})
+    invoice = await db.invoices.find_one({'id': doc.get('invoice_id')})
+    if invoice:
+        all_adj = await db.invoice_adjustments.find({'invoice_id': doc['invoice_id']}).to_list(None)
+        total_add = sum(a.get('amount', 0) for a in all_adj if a.get('adjustment_type') == 'ADD')
+        total_deduct = sum(a.get('amount', 0) for a in all_adj if a.get('adjustment_type') == 'DEDUCT')
+        base_amount = invoice.get('base_amount', invoice.get('total_amount', 0))
+        new_total = base_amount + total_add - total_deduct
+        await db.invoices.update_one({'id': doc['invoice_id']}, {'$set': {
+            'total_amount': new_total, 'remaining_balance': new_total - (invoice.get('total_paid', 0)), 'updated_at': now()
+        }})
+    return {'success': True}
+
+# ─── PAYMENTS ────────────────────────────────────────────────────────────────
+@api.get("/payments")
+async def get_payments(request: Request):
+    require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    query = {}
+    if sp.get('invoice_id'): query['invoice_id'] = sp['invoice_id']
+    if sp.get('payment_type'): query['payment_type'] = sp['payment_type']
+    return serialize_doc(await db.payments.find(query, {'_id': 0}).sort('payment_date', -1).to_list(None))
+
+@api.post("/payments")
+async def create_payment(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin', 'finance']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    invoice = await db.invoices.find_one({'id': body.get('invoice_id')})
+    if not invoice: raise HTTPException(404, 'Invoice not found')
+    outstanding = (invoice.get('total_amount', 0)) - (invoice.get('total_paid', 0))
+    amount = float(body.get('amount', 0) or 0)
+    if amount <= 0: raise HTTPException(400, 'Jumlah pembayaran harus lebih dari 0')
+    if amount > outstanding: raise HTTPException(400, f'Jumlah melebihi sisa tagihan! Maksimal: Rp {outstanding:,.0f}')
+    payment_type = body.get('payment_type') or (
+        'VENDOR_PAYMENT' if invoice.get('invoice_category') == 'VENDOR' else 'CUSTOMER_PAYMENT')
+    payment = {
+        'id': new_id(), 'invoice_id': body['invoice_id'],
+        'invoice_number': invoice.get('invoice_number'),
+        'payment_type': payment_type,
+        'garment_id': invoice.get('garment_id'), 'garment_name': invoice.get('garment_name'),
+        'vendor_or_customer_name': invoice.get('vendor_or_customer_name', invoice.get('vendor_name', invoice.get('customer_name', ''))),
+        'payment_date': parse_date(body.get('payment_date')) or now(),
+        'amount': amount, 'payment_method': body.get('payment_method', 'Transfer Bank'),
+        'reference_number': body.get('reference_number', body.get('reference', '')),
+        'notes': body.get('notes', ''), 'recorded_by': user['name'], 'created_at': now()
+    }
+    await db.payments.insert_one(payment)
+    all_pmts = await db.payments.find({'invoice_id': body['invoice_id']}).to_list(None)
+    total_paid = sum(p.get('amount', 0) for p in all_pmts)
+    new_status = 'Paid' if total_paid >= invoice.get('total_amount', 0) else 'Partial'
+    await db.invoices.update_one({'id': body['invoice_id']}, {'$set': {
+        'status': new_status, 'total_paid': total_paid, 'paid_amount': total_paid,
+        'remaining_balance': invoice.get('total_amount', 0) - total_paid, 'updated_at': now()
+    }})
+    return JSONResponse(serialize_doc(payment), status_code=201)
+
+@api.delete("/payments/{pay_id}")
+async def delete_payment(pay_id: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    doc = await db.payments.find_one({'id': pay_id})
+    if not doc: raise HTTPException(404, 'Not found')
+    await db.payments.delete_one({'id': pay_id})
+    all_pmts = await db.payments.find({'invoice_id': doc.get('invoice_id')}).to_list(None)
+    total_paid = sum(p.get('amount', 0) for p in all_pmts)
+    invoice = await db.invoices.find_one({'id': doc.get('invoice_id')})
+    if invoice:
+        new_status = 'Unpaid' if total_paid <= 0 else ('Paid' if total_paid >= invoice.get('total_amount', 0) else 'Partial')
+        await db.invoices.update_one({'id': doc['invoice_id']}, {'$set': {
+            'status': new_status, 'total_paid': total_paid, 'updated_at': now()
+        }})
+    return {'success': True}
+
+# ─── USERS ───────────────────────────────────────────────────────────────────
+@api.get("/users")
+async def get_users(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    return serialize_doc(await db.users.find({}, {'password': 0, '_id': 0}).sort('created_at', -1).to_list(None))
+
+@api.post("/users")
+async def create_user(request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    hashed = hash_password(body.get('password', 'User@123'))
+    new_user = {'id': new_id(), **body, 'password': hashed, 'status': 'active', 'created_at': now(), 'updated_at': now()}
+    await db.users.insert_one(new_user)
+    result = {k: v for k, v in new_user.items() if k != 'password'}
+    return JSONResponse(serialize_doc(result), status_code=201)
+
+@api.put("/users/{uid}")
+async def update_user(uid: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    body.pop('_id', None); body.pop('id', None)
+    if body.get('password'): body['password'] = hash_password(body['password'])
+    await db.users.update_one({'id': uid}, {'$set': {**body, 'updated_at': now()}})
+    return serialize_doc(await db.users.find_one({'id': uid}, {'password': 0, '_id': 0}))
+
+@api.delete("/users/{uid}")
+async def delete_user(uid: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    doc = await db.users.find_one({'id': uid})
+    if not doc: raise HTTPException(404, 'Not found')
+    if doc.get('role') == 'superadmin': raise HTTPException(403, 'Cannot delete superadmin')
+    if doc['id'] == user['id']: raise HTTPException(403, 'Cannot delete own account')
+    await db.users.delete_one({'id': uid})
+    return {'success': True}
+
+# ─── ACTIVITY LOGS ───────────────────────────────────────────────────────────
+@api.get("/activity-logs")
+async def get_activity_logs(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    sp = request.query_params
+    query = {}
+    if sp.get('module'): query['module'] = sp['module']
+    limit = int(sp.get('limit', '100'))
+    return serialize_doc(await db.activity_logs.find(query, {'_id': 0}).sort('timestamp', -1).limit(limit).to_list(None))
+
+@api.delete("/activity-logs/{log_id}")
+async def delete_activity_log(log_id: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    if log_id == 'all':
+        await db.activity_logs.delete_many({})
+    else:
+        await db.activity_logs.delete_one({'id': log_id})
+    return {'success': True}
+
+# ─── COMPANY SETTINGS ────────────────────────────────────────────────────────
+@api.get("/company-settings")
+async def get_company_settings(request: Request):
+    require_auth(request)
+    db = get_db()
+    settings = await db.company_settings.find_one({'type': 'general'}, {'_id': 0})
+    if not settings:
+        settings = {
+            'id': new_id(), 'type': 'general',
+            'company_name': 'PT Garment ERP System', 'company_address': '',
+            'company_phone': '', 'company_email': '', 'company_website': '',
+            'company_logo_url': '', 'pdf_header_line1': '', 'pdf_header_line2': '',
+            'pdf_footer_text': '', 'created_at': now(), 'updated_at': now()
+        }
+        await db.company_settings.insert_one(settings)
+    return serialize_doc(settings)
+
+@api.post("/company-settings")
+async def save_company_settings(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    existing = await db.company_settings.find_one({'type': 'general'})
+    data = {
+        'company_name': body.get('company_name', ''), 'company_address': body.get('company_address', ''),
+        'company_phone': body.get('company_phone', ''), 'company_email': body.get('company_email', ''),
+        'company_website': body.get('company_website', ''), 'company_logo_url': body.get('company_logo_url', ''),
+        'pdf_header_line1': body.get('pdf_header_line1', ''), 'pdf_header_line2': body.get('pdf_header_line2', ''),
+        'pdf_footer_text': body.get('pdf_footer_text', ''),
+        'updated_by': user['name'], 'updated_at': now()
+    }
+    if existing:
+        await db.company_settings.update_one({'type': 'general'}, {'$set': data})
+    else:
+        await db.company_settings.insert_one({'id': new_id(), 'type': 'general', **data, 'created_at': now()})
+    return serialize_doc(await db.company_settings.find_one({'type': 'general'}, {'_id': 0}))
+
+# ─── MATERIAL REQUESTS ──────────────────────────────────────────────────────
+@api.get("/material-requests")
+async def get_material_requests(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    query = {}
+    sp = request.query_params
+    if user.get('role') == 'vendor': query['vendor_id'] = user.get('vendor_id')
+    if sp.get('request_type'): query['request_type'] = sp['request_type']
+    if sp.get('status'): query['status'] = sp['status']
+    return serialize_doc(await db.material_requests.find(query, {'_id': 0}).sort('created_at', -1).to_list(None))
+
+@api.post("/material-requests")
+async def create_material_request(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
+    if not vendor_id: raise HTTPException(400, 'vendor_id diperlukan')
+    if body.get('request_type') not in ['ADDITIONAL', 'REPLACEMENT']: raise HTTPException(400, 'request_type harus ADDITIONAL atau REPLACEMENT')
+    orig = await db.vendor_shipments.find_one({'id': body.get('original_shipment_id')}) if body.get('original_shipment_id') else None
+    if not orig: raise HTTPException(404, 'Shipment asal tidak ditemukan')
+    # Get PO number for request numbering
+    po_number = body.get('po_number', '')
+    po_id = body.get('po_id', '')
+    if not po_number and po_id:
+        po_doc = await db.production_pos.find_one({'id': po_id})
+        if po_doc: po_number = po_doc.get('po_number', '')
+    if not po_number:
+        # Try to get from shipment items
+        first_si = await db.vendor_shipment_items.find_one({'shipment_id': orig['id']})
+        if first_si:
+            po_number = first_si.get('po_number', '')
+            if not po_id: po_id = first_si.get('po_id', '')
+    # Count existing requests for THIS PO (not global)
+    po_req_count = await db.material_requests.count_documents({'po_number': po_number, 'request_type': body['request_type']}) if po_number else await db.material_requests.count_documents({'request_type': body['request_type']})
+    prefix = 'REQ-ADD' if body['request_type'] == 'ADDITIONAL' else 'REQ-RPL'
+    req_number = f"{prefix}-{po_req_count + 1}-{po_number}" if po_number else f"{prefix}-{str(po_req_count + 1).zfill(4)}"
+    items = body.get('items', [])
+    # Use vendor notes as reason (adopt notes from form)
+    reason = body.get('reason', '') or body.get('notes', '') or body.get('vendor_notes', '')
+    req_doc = {
+        'id': new_id(), 'request_number': req_number, 'request_type': body['request_type'],
+        'vendor_id': vendor_id, 'vendor_name': orig.get('vendor_name', ''),
+        'original_shipment_id': body['original_shipment_id'],
+        'original_shipment_number': orig.get('shipment_number', ''),
+        'po_id': po_id, 'po_number': po_number,
+        'items': items,
+        'total_requested_qty': sum(int(i.get('requested_qty', 0) or 0) for i in items),
+        'reason': reason, 'vendor_notes': body.get('notes', ''), 'status': 'Pending',
+        'created_by': user['name'], 'created_at': now(), 'updated_at': now()
+    }
+    await db.material_requests.insert_one(req_doc)
+    return JSONResponse(serialize_doc(req_doc), status_code=201)
+
+@api.put("/material-requests/{req_id}")
+async def update_material_request(req_id: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    req = await db.material_requests.find_one({'id': req_id})
+    if not req: raise HTTPException(404, 'Request tidak ditemukan')
+    new_status = body.get('status')
+    if new_status == 'Approved' and req.get('status') == 'Pending':
+        orig = await db.vendor_shipments.find_one({'id': req.get('original_shipment_id')})
+        if not orig: raise HTTPException(404, 'Shipment asal tidak ditemukan')
+        existing_children = await db.vendor_shipments.count_documents({
+            'parent_shipment_id': req['original_shipment_id'], 'shipment_type': req['request_type']})
+        suffix = f"A{existing_children + 1}" if req['request_type'] == 'ADDITIONAL' else f"R{existing_children + 1}"
+        child_number = f"{orig.get('shipment_number')}-{suffix}"
+        child_id = new_id()
+        admin_notes = body.get('admin_notes', '')
+        child_ship = {
+            'id': child_id, 'shipment_number': child_number,
+            'delivery_note_number': f"DN-{child_number}",
+            'vendor_id': orig['vendor_id'], 'vendor_name': orig.get('vendor_name', ''),
+            'shipment_date': now(), 'shipment_type': req['request_type'],
+            'parent_shipment_id': req['original_shipment_id'],
+            'material_request_id': req_id, 'status': 'Sent',
+            'notes': admin_notes or f"Child shipment dari {orig.get('shipment_number')}",
+            'notes_for_vendor': admin_notes,
+            'created_by': user['name'], 'created_at': now(), 'updated_at': now()
+        }
+        await db.vendor_shipments.insert_one(child_ship)
+        # Get original shipment items to inherit serial numbers
+        orig_items_map = {}
+        orig_si_list = await db.vendor_shipment_items.find({'shipment_id': orig['id']}).to_list(None)
+        for osi in orig_si_list:
+            if osi.get('po_item_id'):
+                orig_items_map[osi['po_item_id']] = osi
+        for ri in req.get('items', []):
+            # Inherit serial_number from original shipment item or PO item
+            serial = ri.get('serial_number', '')
+            po_item_id = ri.get('po_item_id', '')
+            if not serial and po_item_id:
+                # Try original shipment item
+                orig_si = orig_items_map.get(po_item_id, {})
+                serial = orig_si.get('serial_number', '')
+            if not serial and po_item_id:
+                # Try PO item
+                poi = await db.po_items.find_one({'id': po_item_id})
+                if poi: serial = poi.get('serial_number', '')
+            await db.vendor_shipment_items.insert_one({
+                'id': new_id(), 'shipment_id': child_id, 'shipment_number': child_number,
+                'po_id': req.get('po_id'), 'po_number': req.get('po_number', ''),
+                'po_item_id': po_item_id,
+                'product_name': ri.get('product_name', ''), 'sku': ri.get('sku', ''),
+                'size': ri.get('size', ''), 'color': ri.get('color', ''),
+                'serial_number': serial,
+                'qty_sent': int(ri.get('requested_qty', 0) or 0),
+                'shipment_type': req['request_type'],
+                'parent_shipment_id': req['original_shipment_id'],
+                'created_at': now()
+            })
+        await db.material_requests.update_one({'id': req_id}, {'$set': {
+            'status': 'Approved', 'admin_notes': body.get('admin_notes', ''),
+            'approved_by': user['name'], 'approved_at': now(),
+            'child_shipment_id': child_id, 'child_shipment_number': child_number,
+            'updated_at': now()
+        }})
+        result = serialize_doc(await db.material_requests.find_one({'id': req_id}, {'_id': 0}))
+        result['child_shipment'] = serialize_doc(child_ship)
+        return result
+    elif new_status == 'Rejected':
+        await db.material_requests.update_one({'id': req_id}, {'$set': {
+            'status': 'Rejected', 'admin_notes': body.get('admin_notes', ''), 'updated_at': now()
+        }})
+        return serialize_doc(await db.material_requests.find_one({'id': req_id}, {'_id': 0}))
+    body.pop('_id', None); body.pop('id', None)
+    await db.material_requests.update_one({'id': req_id}, {'$set': {**body, 'updated_at': now()}})
+    return serialize_doc(await db.material_requests.find_one({'id': req_id}, {'_id': 0}))
+
+# ─── MATERIAL DEFECT REPORTS ─────────────────────────────────────────────────
+@api.get("/material-defect-reports")
+async def get_defect_reports(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    query = {}
+    if user.get('role') == 'vendor': query['vendor_id'] = user.get('vendor_id')
+    if request.query_params.get('vendor_id'): query['vendor_id'] = request.query_params['vendor_id']
+    return serialize_doc(await db.material_defect_reports.find(query, {'_id': 0}).sort('created_at', -1).to_list(None))
+
+@api.post("/material-defect-reports")
+async def create_defect_report(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
+    if not vendor_id: raise HTTPException(400, 'vendor_id diperlukan')
+    job_item = await db.production_job_items.find_one({'id': body.get('job_item_id')}) if body.get('job_item_id') else None
+    defect = {
+        'id': new_id(), 'vendor_id': vendor_id,
+        'job_id': body.get('job_id') or (job_item or {}).get('job_id'),
+        'job_item_id': body.get('job_item_id'),
+        'po_id': body.get('po_id'), 'po_item_id': body.get('po_item_id'),
+        'sku': body.get('sku', (job_item or {}).get('sku', '')),
+        'product_name': body.get('product_name', (job_item or {}).get('product_name', '')),
+        'size': body.get('size', (job_item or {}).get('size', '')),
+        'color': body.get('color', (job_item or {}).get('color', '')),
+        'defect_qty': int(body.get('defect_qty', 0) or 0),
+        'defect_type': body.get('defect_type', 'Material Cacat'),
+        'description': body.get('description', ''),
+        'shipment_id': body.get('shipment_id'),
+        'report_date': parse_date(body.get('report_date')) or now(),
+        'status': 'Reported', 'reported_by': user['name'],
+        'created_at': now(), 'updated_at': now()
+    }
+    await db.material_defect_reports.insert_one(defect)
+    return JSONResponse(serialize_doc(defect), status_code=201)
+
+# ─── PRODUCTION RETURNS ──────────────────────────────────────────────────────
+@api.get("/production-returns")
+async def get_returns(request: Request):
+    require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    query = {}
+    if sp.get('status'): query['status'] = sp['status']
+    returns = await db.production_returns.find(query, {'_id': 0}).sort('created_at', -1).to_list(None)
+    result = []
+    for r in returns:
+        items = await db.production_return_items.find({'return_id': r['id']}, {'_id': 0}).to_list(None)
+        result.append({**serialize_doc(r), 'items': serialize_doc(items)})
+    return result
+
+@api.get("/production-returns/{ret_id}")
+async def get_return(ret_id: str, request: Request):
+    require_auth(request)
+    db = get_db()
+    ret = await db.production_returns.find_one({'id': ret_id}, {'_id': 0})
+    if not ret: raise HTTPException(404, 'Not found')
+    items = await db.production_return_items.find({'return_id': ret_id}, {'_id': 0}).to_list(None)
+    result = serialize_doc(ret)
+    result['items'] = serialize_doc(items)
+    return result
+
+@api.post("/production-returns")
+async def create_return(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    return_id = new_id()
+    seq = (await db.production_returns.count_documents({})) + 1
+    return_number = f"RTN-{str(seq).zfill(4)}"
+    ref_po = await db.production_pos.find_one({'id': body.get('reference_po_id')}) if body.get('reference_po_id') else None
+    items_data = body.get('items', [])
+    total_qty = sum(int(i.get('return_qty', 0) or 0) for i in items_data)
+    return_doc = {
+        'id': return_id, 'return_number': return_number,
+        'reference_po_id': body.get('reference_po_id'),
+        'reference_po_number': (ref_po or {}).get('po_number', body.get('reference_po_number', '')),
+        'customer_name': body.get('customer_name', (ref_po or {}).get('customer_name', '')),
+        'buyer_name': body.get('buyer_name', body.get('customer_name', '')),
+        'return_date': parse_date(body.get('return_date')) or now(),
+        'return_reason': body.get('return_reason', ''), 'notes': body.get('notes', ''),
+        'status': 'Repair Needed', 'total_return_qty': total_qty,
+        'created_by': user['name'], 'created_at': now(), 'updated_at': now()
+    }
+    await db.production_returns.insert_one(return_doc)
+    inserted_items = []
+    for item in items_data:
+        ri = {
+            'id': new_id(), 'return_id': return_id,
+            'po_item_id': item.get('po_item_id'),
+            'sku': item.get('sku', ''), 'product_name': item.get('product_name', ''),
+            'serial_number': item.get('serial_number', ''),
+            'size': item.get('size', ''), 'color': item.get('color', ''),
+            'return_qty': int(item.get('return_qty', 0) or 0),
+            'defect_type': item.get('defect_type', ''),
+            'repair_notes': item.get('repair_notes', ''), 'repaired_qty': 0,
+            'created_at': now()
+        }
+        await db.production_return_items.insert_one(ri)
+        inserted_items.append(ri)
+    result = serialize_doc(return_doc)
+    result['items'] = serialize_doc(inserted_items)
+    return JSONResponse(result, status_code=201)
+
+@api.put("/production-returns/{ret_id}")
+async def update_return(ret_id: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    body.pop('_id', None); body.pop('id', None); body.pop('items', None)
+    if body.get('return_date'): body['return_date'] = parse_date(body['return_date'])
+    await db.production_returns.update_one({'id': ret_id}, {'$set': {**body, 'updated_at': now()}})
+    return serialize_doc(await db.production_returns.find_one({'id': ret_id}, {'_id': 0}))
+
+@api.delete("/production-returns/{ret_id}")
+async def delete_return(ret_id: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    doc = await db.production_returns.find_one({'id': ret_id})
+    if not doc: raise HTTPException(404, 'Not found')
+    await db.production_return_items.delete_many({'return_id': ret_id})
+    await db.production_returns.delete_one({'id': ret_id})
+    return {'success': True}
+
+# ─── DASHBOARD ───────────────────────────────────────────────────────────────
+@api.get("/dashboard")
+async def get_dashboard(request: Request):
+    require_auth(request)
+    db = get_db()
+    n = now()
+    three_days = n + timedelta(days=3)
+    # PO counts by status
+    total_pos = await db.production_pos.count_documents({})
+    po_status_counts = {}
+    for st in ["Draft", "Confirmed", "Distributed", "In Production", "Production Complete",
+               "Variance Review", "Return Review", "Ready to Close", "Closed"]:
+        po_status_counts[st] = await db.production_pos.count_documents({'status': st})
+    active_pos = po_status_counts.get('In Production', 0) + po_status_counts.get('Distributed', 0)
+    garments_count = await db.garments.count_documents({'status': 'active'})
+    products_count = await db.products.count_documents({})
+    invoices = await db.invoices.find({}, {'_id': 0}).to_list(None)
+    payments = await db.payments.find({}, {'_id': 0}).to_list(None)
+    # Active jobs
+    all_active_parent_jobs = await db.production_jobs.find({
+        'status': 'In Progress',
+        '$or': [{'parent_job_id': None}, {'parent_job_id': ''}, {'parent_job_id': {'$exists': False}}]
+    }).to_list(None)
+    active_jobs = len(all_active_parent_jobs)
+    # Production stats
+    all_job_items = await db.production_job_items.find({}).to_list(None)
+    total_produced_global = sum(i.get('produced_qty', 0) for i in all_job_items)
+    total_available_global = sum(i.get('available_qty', i.get('shipment_qty', 0)) for i in all_job_items)
+    global_progress_pct = round((total_produced_global / total_available_global * 100) if total_available_global > 0 else 0)
+    # Shipment & request counts
+    pending_shipments = await db.vendor_shipments.count_documents({'status': {'$in': ['Sent', 'In Transit']}})
+    pending_additional = await db.material_requests.count_documents({'request_type': 'ADDITIONAL', 'status': 'Pending'})
+    pending_replacement = await db.material_requests.count_documents({'request_type': 'REPLACEMENT', 'status': 'Pending'})
+    pending_returns = await db.production_returns.count_documents({'status': {'$nin': ['Shipped Back', 'Closed']}})
+    total_buyer_shipments = await db.buyer_shipments.count_documents({})
+    total_vendor_shipments = await db.vendor_shipments.count_documents({'shipment_type': 'NORMAL'})
+    # Accessory stats
+    total_accessories = await db.accessories.count_documents({'status': 'active'})
+    total_acc_shipments = await db.accessory_shipments.count_documents({})
+    pending_acc_inspections = await db.accessory_inspections.count_documents({'status': 'Pending'})
+    pending_acc_requests = await db.accessory_requests.count_documents({'status': 'Pending'})
+    # Financial
+    all_adjustments = await db.invoice_adjustments.find({}).to_list(None)
+    adj_map = {}
+    for adj in all_adjustments:
+        iid = adj.get('invoice_id')
+        if iid not in adj_map: adj_map[iid] = {'add': 0, 'deduct': 0}
+        if adj.get('adjustment_type') == 'ADD': adj_map[iid]['add'] += adj.get('amount', 0)
+        else: adj_map[iid]['deduct'] += adj.get('amount', 0)
+    def get_adj_total(inv):
+        a = adj_map.get(inv['id'], {'add': 0, 'deduct': 0})
+        return (inv.get('base_amount', inv.get('total_amount', 0))) + a['add'] - a['deduct']
+    vendor_invs = [i for i in invoices if i.get('invoice_category') == 'VENDOR']
+    customer_invs = [i for i in invoices if i.get('invoice_category') == 'BUYER']
+    total_vendor_cost = sum(get_adj_total(i) for i in vendor_invs)
+    total_revenue = sum(get_adj_total(i) for i in customer_invs)
+    paid_by_inv = {}
+    for p in payments:
+        if p.get('invoice_id'):
+            paid_by_inv[p['invoice_id']] = paid_by_inv.get(p['invoice_id'], 0) + p.get('amount', 0)
+    total_invoiced_ar = sum(get_adj_total(i) for i in customer_invs)
+    total_invoiced_ap = sum(get_adj_total(i) for i in vendor_invs)
+    total_paid_ar = sum(paid_by_inv.get(i['id'], i.get('total_paid', 0)) for i in customer_invs)
+    total_paid_ap = sum(paid_by_inv.get(i['id'], i.get('total_paid', 0)) for i in vendor_invs)
+    outstanding_ar = total_invoiced_ar - total_paid_ar
+    outstanding_ap = total_invoiced_ap - total_paid_ap
+    # Delayed POs
+    delayed_pos = await db.production_pos.count_documents({
+        'status': {'$in': ['Draft', 'Distributed', 'In Production']},
+        'deadline': {'$lt': n}
+    })
+    # Alerts
+    overdue_pos = await db.production_pos.find({
+        'status': {'$in': ['Draft', 'Distributed', 'In Production']}, 'deadline': {'$lt': n}
+    }, {'_id': 0}).sort('deadline', 1).limit(5).to_list(None)
+    near_deadline = await db.production_pos.find({
+        'status': {'$in': ['Draft', 'Distributed', 'In Production']},
+        'deadline': {'$gte': n, '$lt': three_days}
+    }, {'_id': 0}).sort('deadline', 1).limit(5).to_list(None)
+    unpaid_invs = await db.invoices.find({'status': {'$in': ['Unpaid', 'Partial']}}, {'_id': 0}).sort('created_at', 1).limit(5).to_list(None)
+    # Monthly data (6 months)
+    monthly_data = []
+    for i in range(5, -1, -1):
+        start = datetime(n.year, n.month, 1, tzinfo=timezone.utc) - timedelta(days=i * 30)
+        start = start.replace(day=1)
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1)
+        else:
+            end = start.replace(month=start.month + 1)
+        m_pos = await db.production_pos.count_documents({'created_at': {'$gte': start, '$lt': end}})
+        m_prog_agg = await db.production_progress.aggregate([
+            {'$match': {'progress_date': {'$gte': start, '$lt': end}}},
+            {'$group': {'_id': None, 'total': {'$sum': '$completed_quantity'}}}
+        ]).to_list(None)
+        monthly_data.append({
+            'month': start.strftime('%b %y'), 'pos': m_pos,
+            'production': m_prog_agg[0]['total'] if m_prog_agg else 0
+        })
+    # Work order status distribution (use production_jobs since work_orders may be sparse)
+    wo_status_agg = await db.production_jobs.aggregate([
+        {'$group': {'_id': '$status', 'count': {'$sum': 1}}}
+    ]).to_list(None)
+    # Top garments by production
+    top_garments_agg = await db.production_job_items.aggregate([
+        {'$group': {'_id': '$vendor_name', 'total_qty': {'$sum': '$produced_qty'}}},
+        {'$sort': {'total_qty': -1}}, {'$limit': 5}
+    ]).to_list(None)
+    # If vendor_name is not on job_items, aggregate via jobs
+    if not top_garments_agg or all(not g.get('_id') for g in top_garments_agg):
+        top_garments_agg = []
+        jobs_for_top = await db.production_jobs.find({}).to_list(None)
+        vendor_prod = {}
+        for j in jobs_for_top:
+            vn = j.get('vendor_name', 'Unknown')
+            ji = await db.production_job_items.find({'job_id': j['id']}).to_list(None)
+            vendor_prod[vn] = vendor_prod.get(vn, 0) + sum(i.get('produced_qty', 0) for i in ji)
+        for vn, qty in sorted(vendor_prod.items(), key=lambda x: -x[1])[:5]:
+            top_garments_agg.append({'_id': vn, 'total_qty': qty})
+    # PO status breakdown for drilldown
+    po_status_list = []
+    for st, cnt in po_status_counts.items():
+        if cnt > 0:
+            sample_pos = await db.production_pos.find({'status': st}, {'_id': 0}).limit(5).to_list(None)
+            po_status_list.append({'status': st, 'count': cnt, 'samples': serialize_doc(sample_pos)})
+    # Reminders
+    pending_reminders = await db.reminders.count_documents({'status': 'pending'})
+    # On-time rate
+    closed_pos = await db.production_pos.find({'status': 'Closed'}).to_list(None)
+    on_time = sum(1 for p in closed_pos if p.get('deadline') and p.get('updated_at') and p['updated_at'] <= p['deadline'])
+    on_time_rate = round((on_time / len(closed_pos) * 100) if closed_pos else 0)
+    return {
+        'totalPOs': total_pos, 'activePOs': active_pos, 'garments': garments_count,
+        'products': products_count,
+        'poStatusCounts': po_status_counts,
+        'poStatusList': po_status_list,
+        'totalInvoiced': total_invoiced_ar + total_invoiced_ap,
+        'totalPaid': total_paid_ar + total_paid_ap,
+        'outstanding': outstanding_ar + outstanding_ap,
+        'totalVendorCost': total_vendor_cost, 'totalRevenue': total_revenue,
+        'grossMargin': total_revenue - total_vendor_cost,
+        'totalInvoicedAR': total_invoiced_ar, 'totalInvoicedAP': total_invoiced_ap,
+        'outstandingAR': outstanding_ar, 'outstandingAP': outstanding_ap,
+        'totalPaidAR': total_paid_ar, 'totalPaidAP': total_paid_ap,
+        'activeJobs': active_jobs,
+        'pendingShipments': pending_shipments,
+        'pendingAdditionalRequests': pending_additional,
+        'pendingReplacementRequests': pending_replacement,
+        'pendingReturns': pending_returns,
+        'totalBuyerShipments': total_buyer_shipments,
+        'totalVendorShipments': total_vendor_shipments,
+        'totalProducedGlobal': total_produced_global,
+        'totalAvailableGlobal': total_available_global,
+        'globalProgressPct': global_progress_pct,
+        'totalAccessories': total_accessories,
+        'totalAccShipments': total_acc_shipments,
+        'pendingAccInspections': pending_acc_inspections,
+        'pendingAccRequests': pending_acc_requests,
+        'unpaidInvoices': sum(1 for i in invoices if i.get('status') == 'Unpaid'),
+        'partialInvoices': sum(1 for i in invoices if i.get('status') == 'Partial'),
+        'delayedPOs': delayed_pos,
+        'monthlyData': monthly_data,
+        'woStatus': wo_status_agg,
+        'topGarments': top_garments_agg,
+        'pendingReminders': pending_reminders,
+        'onTimeRate': on_time_rate,
+        'alerts': {
+            'overduePos': serialize_doc(overdue_pos),
+            'nearDeadlinePos': serialize_doc(near_deadline),
+            'unpaidInvoices': serialize_doc(unpaid_invs)
+        }
+    }
+
+# ─── VENDOR DASHBOARD ────────────────────────────────────────────────────────
+@api.get("/vendor/dashboard")
+async def get_vendor_dashboard(request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'vendor': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    vendor_id = user.get('vendor_id')
+    jobs = await db.production_jobs.find({'vendor_id': vendor_id}, {'_id': 0}).sort('created_at', -1).to_list(None)
+    active_jobs = len([j for j in jobs if j.get('status') == 'In Progress' and not j.get('parent_job_id')])
+    completed_jobs = len([j for j in jobs if j.get('status') == 'Completed'])
+    incoming = await db.vendor_shipments.count_documents({'vendor_id': vendor_id, 'status': 'Sent'})
+    all_job_ids = [j['id'] for j in jobs]
+    all_job_items = await db.production_job_items.find({'job_id': {'$in': all_job_ids}}).to_list(None) if all_job_ids else []
+    total_produced = sum(i.get('produced_qty', 0) for i in all_job_items)
+    total_available = sum(i.get('available_qty', i.get('shipment_qty', 0)) for i in all_job_items)
+    return {
+        'activeJobs': active_jobs, 'completedJobs': completed_jobs,
+        'incomingShipments': incoming,
+        'totalProduced': total_produced, 'totalAvailable': total_available,
+        'progressPct': round((total_produced / total_available * 100) if total_available > 0 else 0),
+        'recentProgress': [], 'alerts': {'overdueJobs': [], 'nearDeadlineJobs': []}
+    }
+
+# ─── GLOBAL SEARCH ───────────────────────────────────────────────────────────
+@api.get("/global-search")
+async def global_search(request: Request):
+    require_auth(request)
+    db = get_db()
+    q = request.query_params.get('q', '').strip()
+    if not q: return {'results': []}
+    regex = {'$regex': q, '$options': 'i'}
+    pos = await db.production_pos.find({'$or': [{'po_number': regex}, {'customer_name': regex}]}).limit(5).to_list(None)
+    vendors = await db.garments.find({'$or': [{'garment_name': regex}, {'garment_code': regex}]}).limit(5).to_list(None)
+    products = await db.products.find({'$or': [{'product_name': regex}, {'product_code': regex}]}).limit(5).to_list(None)
+    variants = await db.product_variants.find({'sku': regex}).limit(5).to_list(None)
+    # Search by serial number
+    serial_items = await db.po_items.find({'serial_number': regex}).limit(5).to_list(None)
+    buyers = await db.buyers.find({'$or': [{'buyer_name': regex}, {'buyer_code': regex}]}).limit(5).to_list(None)
+    results = (
+        [{'type': 'PO', 'id': p['id'], 'label': p.get('po_number'), 'sub': p.get('customer_name'), 'module': 'production-po'} for p in pos] +
+        [{'type': 'Vendor', 'id': v['id'], 'label': v.get('garment_name'), 'sub': v.get('garment_code'), 'module': 'garments'} for v in vendors] +
+        [{'type': 'Produk', 'id': p['id'], 'label': p.get('product_name'), 'sub': p.get('product_code'), 'module': 'products'} for p in products] +
+        [{'type': 'SKU', 'id': v['id'], 'label': v.get('sku'), 'sub': f"{v.get('size','')}/{v.get('color','')}", 'module': 'products'} for v in variants] +
+        [{'type': 'Serial', 'id': s['id'], 'label': s.get('serial_number'), 'sub': f"{s.get('product_name','')} | {s.get('po_number','')}", 'module': 'serial-tracking'} for s in serial_items] +
+        [{'type': 'Buyer', 'id': b['id'], 'label': b.get('buyer_name'), 'sub': b.get('buyer_code'), 'module': 'buyers'} for b in buyers]
+    )
+    return {'results': results}
+
+# ─── ATTACHMENTS ─────────────────────────────────────────────────────────────
+@api.get("/attachments")
+async def get_attachments(request: Request):
+    require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    entity_type = sp.get('entity_type')
+    entity_id = sp.get('entity_id')
+    if not entity_type or not entity_id: raise HTTPException(400, 'entity_type and entity_id required')
+    return serialize_doc(await db.attachments.find({'entity_type': entity_type, 'entity_id': entity_id}, {'_id': 0}).sort('uploaded_at', -1).to_list(None))
+
+# ─── FINANCIAL RECAP ─────────────────────────────────────────────────────────
+@api.get("/financial-recap")
+async def financial_recap(request: Request):
+    require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    inv_query = {}
+    pmt_query = {}
+    if sp.get('date_from') or sp.get('date_to'):
+        d_range = {}
+        if sp.get('date_from'): d_range['$gte'] = parse_date(sp['date_from'])
+        if sp.get('date_to'): d_range['$lte'] = to_end_of_day(sp['date_to'])
+        inv_query['created_at'] = d_range
+        pmt_query['payment_date'] = d_range
+    invoices = await db.invoices.find(inv_query, {'_id': 0}).to_list(None)
+    payments = await db.payments.find(pmt_query, {'_id': 0}).to_list(None)
+    all_adj = await db.invoice_adjustments.find({}).to_list(None)
+    adj_map = {}
+    for adj in all_adj:
+        iid = adj.get('invoice_id')
+        if iid not in adj_map: adj_map[iid] = {'add': 0, 'deduct': 0}
+        if adj.get('adjustment_type') == 'ADD': adj_map[iid]['add'] += adj.get('amount', 0)
+        else: adj_map[iid]['deduct'] += adj.get('amount', 0)
+    vendor_invs = [i for i in invoices if i.get('invoice_category') == 'VENDOR']
+    buyer_invs = [i for i in invoices if i.get('invoice_category') == 'BUYER']
+    def adj_total(inv):
+        a = adj_map.get(inv['id'], {'add': 0, 'deduct': 0})
+        return (inv.get('base_amount', inv.get('total_amount', 0))) + a['add'] - a['deduct']
+    total_sales = sum(adj_total(i) for i in buyer_invs)
+    total_cost = sum(adj_total(i) for i in vendor_invs)
+    vendor_pmts = [p for p in payments if p.get('payment_type') == 'VENDOR_PAYMENT' or any(vi['id'] == p.get('invoice_id') for vi in vendor_invs)]
+    cust_pmts = [p for p in payments if p.get('payment_type') == 'CUSTOMER_PAYMENT' or any(bi['id'] == p.get('invoice_id') for bi in buyer_invs)]
+    total_cash_in = sum(p.get('amount', 0) for p in cust_pmts)
+    total_cash_out = sum(p.get('amount', 0) for p in vendor_pmts)
+    gross_margin = total_sales - total_cost
+    return {
+        'total_sales_value': total_sales, 'total_vendor_cost': total_cost,
+        'total_cash_in': total_cash_in, 'total_cash_out': total_cash_out,
+        'gross_margin': gross_margin,
+        'gross_margin_pct': round((gross_margin / total_sales * 100) if total_sales > 0 else 0),
+        'total_invoiced': total_sales + total_cost, 'total_paid': total_cash_in + total_cash_out,
+        'total_outstanding': (total_sales - total_cash_in) + (total_cost - total_cash_out),
+        'accounts_receivable_outstanding': total_sales - total_cash_in,
+        'accounts_payable_outstanding': total_cost - total_cash_out,
+        'total_vendor_invoices': len(vendor_invs), 'total_buyer_invoices': len(buyer_invs),
+        'garment_summary': [], 'monthly_trend': [],
+        'invoices': serialize_doc(invoices), 'payments': serialize_doc(payments)
+    }
+
+# ─── ACCOUNTS PAYABLE / RECEIVABLE ──────────────────────────────────────────
+@api.get("/accounts-payable")
+async def accounts_payable(request: Request):
+    require_auth(request)
+    db = get_db()
+    return serialize_doc(await db.invoices.find({'invoice_category': 'VENDOR'}, {'_id': 0}).sort('created_at', -1).to_list(None))
+
+@api.get("/accounts-receivable")
+async def accounts_receivable(request: Request):
+    require_auth(request)
+    db = get_db()
+    return serialize_doc(await db.invoices.find({'invoice_category': 'BUYER'}, {'_id': 0}).sort('created_at', -1).to_list(None))
+
+# ─── REPORTS ─────────────────────────────────────────────────────────────────
+@api.get("/reports/{report_type}")
+async def get_report(report_type: str, request: Request):
+    require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    if report_type == 'production':
+        po_query = {}
+        if sp.get('status'): po_query['status'] = sp['status']
+        pos = await db.production_pos.find(po_query, {'_id': 0}).sort('created_at', -1).to_list(None)
+        rows = []
+        for po in pos:
+            if sp.get('vendor_id') and po.get('vendor_id') != sp['vendor_id']: continue
+            items = await db.po_items.find({'po_id': po['id']}).to_list(None)
+            for item in items:
+                if sp.get('serial_number') and item.get('serial_number') != sp['serial_number']: continue
+                rows.append({
+                    'tanggal': serialize_doc(po.get('po_date', po.get('created_at'))),
+                    'no_po': po.get('po_number'), 'no_seri': item.get('serial_number', ''),
+                    'nama_produk': item.get('product_name', ''), 'sku': item.get('sku', ''),
+                    'size': item.get('size', ''), 'warna': item.get('color', ''),
+                    'output_qty': item.get('qty', 0),
+                    'harga': item.get('selling_price_snapshot', 0), 'hpp': item.get('cmt_price_snapshot', 0),
+                    'garment': po.get('vendor_name', ''), 'po_status': po.get('status'),
+                })
+        return rows
+    if report_type == 'financial':
+        inv_query = {}
+        if sp.get('status'): inv_query['status'] = sp['status']
+        invoices = await db.invoices.find(inv_query, {'_id': 0}).sort('created_at', -1).to_list(None)
+        return serialize_doc(invoices)
+    if report_type == 'shipment':
+        vs = await db.vendor_shipments.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+        bs = await db.buyer_shipments.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+        rows = []
+        for v in vs:
+            if sp.get('vendor_id') and v.get('vendor_id') != sp['vendor_id']: continue
+            items = await db.vendor_shipment_items.find({'shipment_id': v['id']}).to_list(None)
+            rows.append({'direction': 'VENDOR → PRODUKSI', 'shipment_number': v.get('shipment_number'),
+                         'shipment_type': v.get('shipment_type', 'NORMAL'),
+                         'vendor_name': v.get('vendor_name', ''), 'status': v.get('status'),
+                         'inspection_status': v.get('inspection_status', 'Pending'),
+                         'date': serialize_doc(v.get('shipment_date', v.get('created_at'))),
+                         'total_qty': sum(i.get('qty_sent', 0) for i in items), 'item_count': len(items)})
+        for b in bs:
+            if sp.get('vendor_id') and b.get('vendor_id') != sp['vendor_id']: continue
+            items = await db.buyer_shipment_items.find({'shipment_id': b['id']}).to_list(None)
+            rows.append({'direction': 'PRODUKSI → BUYER', 'shipment_number': b.get('shipment_number'),
+                         'shipment_type': 'NORMAL', 'vendor_name': b.get('vendor_name', ''),
+                         'status': b.get('status', b.get('ship_status', '')),
+                         'date': serialize_doc(b.get('created_at')),
+                         'total_qty': sum(i.get('qty_shipped', 0) for i in items), 'item_count': len(items)})
+        return rows
+    if report_type == 'progress':
+        progs = await db.production_progress.find({}, {'_id': 0}).sort('progress_date', -1).to_list(None)
+        rows = []
+        for p in progs:
+            ji = await db.production_job_items.find_one({'id': p.get('job_item_id')}) if p.get('job_item_id') else None
+            job = await db.production_jobs.find_one({'id': p.get('job_id')}) if p.get('job_id') else None
+            if sp.get('vendor_id') and (job or {}).get('vendor_id') != sp['vendor_id']: continue
+            rows.append({
+                'date': serialize_doc(p.get('progress_date')),
+                'job_number': (job or {}).get('job_number', ''),
+                'po_number': (job or {}).get('po_number', ''),
+                'vendor_name': (job or {}).get('vendor_name', ''),
+                'serial_number': (ji or {}).get('serial_number', ''),
+                'sku': (ji or {}).get('sku', p.get('sku', '')),
+                'product_name': (ji or {}).get('product_name', p.get('product_name', '')),
+                'qty_progress': p.get('completed_quantity', 0),
+                'notes': p.get('notes', ''), 'recorded_by': p.get('recorded_by', '')
+            })
+        return rows
+    if report_type == 'defect':
+        defects = await db.material_defect_reports.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+        rows = []
+        for d in defects:
+            if sp.get('vendor_id') and d.get('vendor_id') != sp['vendor_id']: continue
+            rows.append({
+                'date': serialize_doc(d.get('report_date', d.get('created_at'))),
+                'vendor_id': d.get('vendor_id'), 'sku': d.get('sku', ''),
+                'product_name': d.get('product_name', ''),
+                'size': d.get('size', ''), 'color': d.get('color', ''),
+                'defect_qty': d.get('defect_qty', 0), 'defect_type': d.get('defect_type', ''),
+                'description': d.get('description', ''), 'status': d.get('status', '')
+            })
+        return rows
+    if report_type == 'return':
+        returns = await db.production_returns.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+        rows = []
+        for r in returns:
+            items = await db.production_return_items.find({'return_id': r['id']}).to_list(None)
+            rows.append({
+                'return_number': r.get('return_number', ''),
+                'po_number': r.get('reference_po_number', ''),
+                'customer_name': r.get('customer_name', ''),
+                'return_date': serialize_doc(r.get('return_date')),
+                'total_qty': sum(i.get('return_qty', 0) for i in items),
+                'item_count': len(items), 'reason': r.get('return_reason', ''),
+                'status': r.get('status', ''), 'notes': r.get('notes', '')
+            })
+        return rows
+    if report_type == 'missing-material':
+        reqs = await db.material_requests.find({'request_type': 'ADDITIONAL'}, {'_id': 0}).sort('created_at', -1).to_list(None)
+        rows = []
+        for r in reqs:
+            if sp.get('vendor_id') and r.get('vendor_id') != sp['vendor_id']: continue
+            rows.append({
+                'request_number': r.get('request_number', ''), 'request_type': r.get('request_type'),
+                'vendor_name': r.get('vendor_name', ''), 'po_number': r.get('po_number', ''),
+                'total_requested_qty': r.get('total_requested_qty', 0),
+                'reason': r.get('reason', ''), 'status': r.get('status', ''),
+                'child_shipment_number': r.get('child_shipment_number', ''),
+                'created_at': serialize_doc(r.get('created_at'))
+            })
+        return rows
+    if report_type == 'replacement':
+        reqs = await db.material_requests.find({'request_type': 'REPLACEMENT'}, {'_id': 0}).sort('created_at', -1).to_list(None)
+        rows = []
+        for r in reqs:
+            if sp.get('vendor_id') and r.get('vendor_id') != sp['vendor_id']: continue
+            rows.append({
+                'request_number': r.get('request_number', ''), 'request_type': r.get('request_type'),
+                'vendor_name': r.get('vendor_name', ''), 'po_number': r.get('po_number', ''),
+                'total_requested_qty': r.get('total_requested_qty', 0),
+                'reason': r.get('reason', ''), 'status': r.get('status', ''),
+                'child_shipment_number': r.get('child_shipment_number', ''),
+                'created_at': serialize_doc(r.get('created_at'))
+            })
+        return rows
+    if report_type == 'accessory':
+        acc_ships = await db.accessory_shipments.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+        rows = []
+        for s in acc_ships:
+            if sp.get('vendor_id') and s.get('vendor_id') != sp['vendor_id']: continue
+            items = await db.accessory_shipment_items.find({'shipment_id': s['id']}).to_list(None)
+            for item in items:
+                rows.append({
+                    'shipment_number': s.get('shipment_number', ''),
+                    'vendor_name': s.get('vendor_name', ''), 'po_number': s.get('po_number', ''),
+                    'date': serialize_doc(s.get('shipment_date')),
+                    'accessory_name': item.get('accessory_name', ''), 'accessory_code': item.get('accessory_code', ''),
+                    'qty_sent': item.get('qty_sent', 0), 'unit': item.get('unit', 'pcs'),
+                    'status': s.get('status', ''), 'inspection_status': s.get('inspection_status', 'Pending')
+                })
+        return rows
+    return {'error': 'Unknown report type', 'available_types': [
+        'production', 'financial', 'shipment', 'progress', 'defect', 'return',
+        'missing-material', 'replacement', 'accessory']}
+
+# ─── PRODUCTION MONITORING V2 ────────────────────────────────────────────────
+@api.get("/production-monitoring-v2")
+async def production_monitoring(request: Request):
+    require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    g_query = {'status': 'active'}
+    if sp.get('vendor_id'): g_query['id'] = sp['vendor_id']
+    garments = await db.garments.find(g_query, {'_id': 0}).to_list(None)
+    result = []
+    for g in garments:
+        parent_jobs = await db.production_jobs.find({
+            'vendor_id': g['id'],
+            '$or': [{'parent_job_id': None}, {'parent_job_id': ''}, {'parent_job_id': {'$exists': False}}]
+        }, {'_id': 0}).sort('created_at', -1).to_list(None)
+        if not parent_jobs: continue
+        all_job_items = []
+        for job in parent_jobs:
+            items = await db.production_job_items.find({'job_id': job['id']}, {'_id': 0}).to_list(None)
+            child_jobs = await db.production_jobs.find({'parent_job_id': job['id']}).to_list(None)
+            for item in items:
+                child_produced = 0
+                for cj in child_jobs:
+                    cji = await db.production_job_items.find_one({'job_id': cj['id'], 'po_item_id': item.get('po_item_id')}) if item.get('po_item_id') else None
+                    if cji: child_produced += cji.get('produced_qty', 0)
+                total_prod = (item.get('produced_qty', 0)) + child_produced
+                all_job_items.append({**item, 'total_produced_qty': total_prod, 'job': job})
+        total_qty = sum(i.get('ordered_qty', 0) for i in all_job_items)
+        total_produced = sum(i.get('total_produced_qty', 0) for i in all_job_items)
+        pct = round((total_produced / total_qty * 100) if total_qty > 0 else 0)
+        result.append({
+            'vendor_id': g['id'], 'vendor_name': g.get('garment_name'),
+            'vendor_code': g.get('garment_code'), 'location': g.get('location', ''),
+            'total_jobs': len(parent_jobs), 'total_qty': total_qty,
+            'total_produced': total_produced, 'progress_pct': pct,
+            'jobs_by_status': {
+                'in_progress': len([j for j in parent_jobs if j.get('status') == 'In Progress']),
+                'completed': len([j for j in parent_jobs if j.get('status') == 'Completed'])
+            }
+        })
+    return result
+
+# ─── DISTRIBUSI KERJA ────────────────────────────────────────────────────────
+@api.get("/distribusi-kerja")
+async def distribusi_kerja(request: Request):
+    require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    # Get all POs (or filtered by vendor)
+    po_query = {}
+    if sp.get('vendor_id'): po_query['vendor_id'] = sp['vendor_id']
+    if sp.get('po_id'): po_query['id'] = sp['po_id']
+    pos = await db.production_pos.find(po_query, {'_id': 0}).sort('created_at', -1).to_list(None)
+    flat_rows = []
+    for po in pos:
+        po_items = await db.po_items.find({'po_id': po['id']}).to_list(None)
+        for pi in po_items:
+            # Aggregate received across ALL shipments (parent + child) for this po_item_id
+            all_ship_items = await db.vendor_shipment_items.find({'po_item_id': pi['id']}).to_list(None)
+            total_received = 0
+            total_sent = 0
+            for si in all_ship_items:
+                total_sent += si.get('qty_sent', 0)
+                insp = await db.vendor_material_inspections.find_one({'shipment_id': si.get('shipment_id')})
+                if insp:
+                    ii = await db.vendor_material_inspection_items.find_one({
+                        'inspection_id': insp['id'], 'shipment_item_id': si['id']})
+                    if ii:
+                        total_received += ii.get('received_qty', 0)
+            # Get production info
+            ji_list = await db.production_job_items.find({'po_item_id': pi['id']}).to_list(None)
+            produced_qty = sum(j.get('produced_qty', 0) for j in ji_list)
+            ordered_qty = pi.get('qty', 0)
+            progress_pct = round((produced_qty / ordered_qty * 100) if ordered_qty > 0 else 0)
+            flat_rows.append({
+                'id': pi['id'], 'po_item_id': pi['id'],
+                'vendor_id': po.get('vendor_id'), 'vendor_name': po.get('vendor_name', ''),
+                'po_id': po['id'], 'po_number': po.get('po_number', ''),
+                'po_date': serialize_doc(po.get('created_at')),
+                'customer_name': po.get('customer_name', ''),
+                'serial_number': pi.get('serial_number', ''),
+                'product_name': pi.get('product_name', ''), 'sku': pi.get('sku', ''),
+                'size': pi.get('size', ''), 'color': pi.get('color', ''),
+                'ordered_qty': ordered_qty, 'shipment_qty': total_sent,
+                'received_qty': total_received, 'produced_qty': produced_qty,
+                'progress_pct': progress_pct,
+            })
+    # Build hierarchy
+    vendor_map = {}
+    for row in flat_rows:
+        vid = row.get('vendor_id')
+        if vid not in vendor_map:
+            vendor_map[vid] = {'vendor_id': vid, 'vendor_name': row.get('vendor_name'),
+                               'total_ordered': 0, 'total_received': 0, 'total_produced': 0, 'pos': {}}
+        vm = vendor_map[vid]
+        vm['total_ordered'] += row.get('ordered_qty', 0)
+        vm['total_received'] += row.get('received_qty', 0)
+        vm['total_produced'] += row.get('produced_qty', 0)
+        po_key = row.get('po_id', 'unknown')
+        if po_key not in vm['pos']:
+            vm['pos'][po_key] = {'po_id': row.get('po_id'), 'po_number': row.get('po_number'),
+                                  'customer_name': row.get('customer_name'),
+                                  'total_ordered': 0, 'total_received': 0, 'total_produced': 0, 'serials': {}}
+        pm = vm['pos'][po_key]
+        pm['total_ordered'] += row.get('ordered_qty', 0)
+        pm['total_received'] += row.get('received_qty', 0)
+        pm['total_produced'] += row.get('produced_qty', 0)
+        sn = row.get('serial_number', '__no_serial__')
+        if sn not in pm['serials']:
+            pm['serials'][sn] = {'serial_number': row.get('serial_number', ''),
+                                  'total_ordered': 0, 'total_received': 0, 'total_produced': 0, 'skus': []}
+        sm = pm['serials'][sn]
+        sm['total_ordered'] += row.get('ordered_qty', 0)
+        sm['total_received'] += row.get('received_qty', 0)
+        sm['total_produced'] += row.get('produced_qty', 0)
+        sm['skus'].append(row)
+    hierarchy = []
+    for vm in vendor_map.values():
+        vm['progress_pct'] = round((vm['total_produced'] / vm['total_ordered'] * 100) if vm['total_ordered'] > 0 else 0)
+        pos_list = []
+        for pm in vm['pos'].values():
+            pm['progress_pct'] = round((pm['total_produced'] / pm['total_ordered'] * 100) if pm['total_ordered'] > 0 else 0)
+            serials_list = []
+            for sm in pm['serials'].values():
+                sm['progress_pct'] = round((sm['total_produced'] / sm['total_ordered'] * 100) if sm['total_ordered'] > 0 else 0)
+                serials_list.append(sm)
+            pm['serials'] = serials_list
+            pos_list.append(pm)
+        vm['pos'] = pos_list
+        hierarchy.append(vm)
+    return {'hierarchy': hierarchy, 'flat': flat_rows, 'invalid_records': []}
+
+# ─── WORK ORDERS ─────────────────────────────────────────────────────────────
+@api.get("/work-orders")
+async def get_work_orders(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    query = {}
+    if sp.get('po_id'): query['po_id'] = sp['po_id']
+    if sp.get('garment_id'): query['garment_id'] = sp['garment_id']
+    if sp.get('status'): query['status'] = sp['status']
+    if user.get('role') == 'vendor': query['garment_id'] = user.get('vendor_id')
+    return serialize_doc(await db.work_orders.find(query, {'_id': 0}).sort('created_at', -1).to_list(None))
+
+@api.post("/work-orders")
+async def create_work_order(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    po = await db.production_pos.find_one({'id': body.get('po_id')})
+    if not po: raise HTTPException(404, 'PO not found')
+    garment = await db.garments.find_one({'id': body.get('garment_id')})
+    if not garment: raise HTTPException(404, 'Garment not found')
+    wo = {
+        'id': new_id(), 'distribution_code': f"WO-{po.get('po_number')}-{garment.get('garment_code')}",
+        'po_id': body['po_id'], 'po_number': po.get('po_number'),
+        'customer_name': po.get('customer_name'),
+        'garment_id': body['garment_id'], 'garment_name': garment.get('garment_name'),
+        'garment_code': garment.get('garment_code'),
+        'quantity': int(body.get('quantity', 0)), 'completed_quantity': 0,
+        'status': 'Waiting', 'notes': body.get('notes', ''),
+        'created_by': user['name'], 'created_at': now(), 'updated_at': now()
+    }
+    await db.work_orders.insert_one(wo)
+    await db.production_pos.update_one({'id': body['po_id']}, {'$set': {'status': 'Distributed', 'updated_at': now()}})
+    return JSONResponse(serialize_doc(wo), status_code=201)
+
+@api.delete("/work-orders/{woid}")
+async def delete_work_order(woid: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    doc = await db.work_orders.find_one({'id': woid})
+    if not doc: raise HTTPException(404, 'Not found')
+    await db.production_progress.delete_many({'work_order_id': woid})
+    await db.work_orders.delete_one({'id': woid})
+    return {'success': True}
+
+# ─── RECALCULATE JOBS ────────────────────────────────────────────────────────
+@api.post("/recalculate-jobs")
+async def recalculate_jobs(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    fixed = 0
+    # First: backfill po_item_id on child shipment items that are missing it
+    orphan_items = await db.vendor_shipment_items.find({'$or': [{'po_item_id': None}, {'po_item_id': ''}, {'po_item_id': {'$exists': False}}]}).to_list(None)
+    for oi in orphan_items:
+        ship = await db.vendor_shipments.find_one({'id': oi.get('shipment_id')})
+        if not ship or not ship.get('parent_shipment_id'):
+            continue
+        # Find matching item in parent shipment by sku+size+color
+        parent_items = await db.vendor_shipment_items.find({'shipment_id': ship['parent_shipment_id']}).to_list(None)
+        for pi in parent_items:
+            if pi.get('sku') == oi.get('sku') and pi.get('size', '') == oi.get('size', '') and pi.get('color', '') == oi.get('color', ''):
+                if pi.get('po_item_id'):
+                    await db.vendor_shipment_items.update_one({'id': oi['id']}, {'$set': {
+                        'po_item_id': pi['po_item_id'], 'po_id': pi.get('po_id', ''),
+                        'po_number': pi.get('po_number', ''), 'serial_number': pi.get('serial_number', ''),
+                    }})
+                    break
+        # If still no match, try grandparent
+        if not pi.get('po_item_id'):
+            gp_ship = await db.vendor_shipments.find_one({'id': ship['parent_shipment_id']})
+            if gp_ship and gp_ship.get('parent_shipment_id'):
+                gp_items = await db.vendor_shipment_items.find({'shipment_id': gp_ship['parent_shipment_id']}).to_list(None)
+                for gpi in gp_items:
+                    if gpi.get('sku') == oi.get('sku') and gpi.get('size', '') == oi.get('size', '') and gpi.get('color', '') == oi.get('color', ''):
+                        if gpi.get('po_item_id'):
+                            await db.vendor_shipment_items.update_one({'id': oi['id']}, {'$set': {
+                                'po_item_id': gpi['po_item_id'], 'po_id': gpi.get('po_id', ''),
+                                'po_number': gpi.get('po_number', ''), 'serial_number': gpi.get('serial_number', ''),
+                            }})
+                            break
+    # Now recalculate job items
+    all_jobs = await db.production_jobs.find({}).to_list(None)
+    for job in all_jobs:
+        job_items = await db.production_job_items.find({'job_id': job['id']}).to_list(None)
+        for ji in job_items:
+            po_item_id = ji.get('po_item_id')
+            if not po_item_id:
+                continue
+            # Aggregate received qty across ALL shipments (parent + children) for this po_item
+            all_ship_items = await db.vendor_shipment_items.find({'po_item_id': po_item_id}).to_list(None)
+            total_received = 0
+            total_defect = 0
+            for si in all_ship_items:
+                insp = await db.vendor_material_inspections.find_one({'shipment_id': si.get('shipment_id')})
+                if insp:
+                    insp_item = await db.vendor_material_inspection_items.find_one({
+                        'inspection_id': insp['id'], 'shipment_item_id': si['id']})
+                    if insp_item:
+                        total_received += insp_item.get('received_qty', 0)
+                        total_defect += insp_item.get('defect_qty', 0)
+            new_avail = max(0, total_received - total_defect)
+            sn = ji.get('serial_number', '')
+            if not sn and po_item_id:
+                poi = await db.po_items.find_one({'id': po_item_id})
+                sn = (poi or {}).get('serial_number', '')
+            await db.production_job_items.update_one({'id': ji['id']}, {'$set': {
+                'available_qty': new_avail, 'serial_number': sn,
+                'total_received_qty': total_received, 'updated_at': now()
+            }})
+            fixed += 1
+    return {'success': True, 'items_updated': fixed, 'jobs_processed': len(all_jobs), 'orphans_fixed': len(orphan_items)}
+
+# ─── IMPORT DATA ─────────────────────────────────────────────────────────────
+@api.post("/import-data")
+async def import_data(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    import_type = body.get('type', '')
+    data_rows = body.get('data', [])
+    imported = 0
+    errors = []
+    if import_type == 'products':
+        for row in data_rows:
+            try:
+                prod_id = new_id()
+                prod = {'id': prod_id, 'product_code': row.get('product_code', ''),
+                        'product_name': row.get('product_name', ''), 'category': row.get('category', ''),
+                        'cmt_price': float(row.get('cmt_price', 0) or 0),
+                        'selling_price': float(row.get('selling_price', 0) or 0),
+                        'status': 'active', 'created_at': now(), 'updated_at': now()}
+                await db.products.insert_one(prod)
+                # Import variants if provided
+                for v in row.get('variants', []):
+                    await db.product_variants.insert_one({
+                        'id': new_id(), 'product_id': prod_id,
+                        'product_code': prod['product_code'], 'product_name': prod['product_name'],
+                        'sku': v.get('sku', ''), 'size': v.get('size', ''), 'color': v.get('color', ''),
+                        'status': 'active', 'created_at': now()})
+                imported += 1
+            except Exception as e: errors.append(f"Row {imported+1}: {str(e)}")
+    elif import_type == 'garments':
+        for row in data_rows:
+            try:
+                gid = new_id()
+                code_slug = (row.get('garment_code', gid)).lower()
+                code_slug = ''.join(c for c in code_slug if c.isalnum())
+                email = f"vendor.{code_slug}@garment.com"
+                raw_pw = generate_password(10)
+                await db.users.insert_one({'id': new_id(), 'name': row.get('garment_name', ''),
+                    'email': email, 'password': hash_password(raw_pw), 'role': 'vendor',
+                    'vendor_id': gid, 'status': 'active', 'created_at': now(), 'updated_at': now()})
+                await db.garments.insert_one({'id': gid, **row, 'status': 'active',
+                    'login_email': email, 'vendor_password_plain': raw_pw,
+                    'created_at': now(), 'updated_at': now()})
+                imported += 1
+            except Exception as e: errors.append(f"Row {imported+1}: {str(e)}")
+    elif import_type == 'production-pos':
+        for row in data_rows:
+            try:
+                vendor_name = ''
+                if row.get('vendor_id'):
+                    vd = await db.garments.find_one({'id': row['vendor_id']})
+                    vendor_name = (vd or {}).get('garment_name', '')
+                po_id = new_id()
+                po = {'id': po_id, 'po_number': row.get('po_number', ''),
+                      'customer_name': row.get('customer_name', ''),
+                      'vendor_id': row.get('vendor_id'), 'vendor_name': vendor_name,
+                      'po_date': parse_date(row.get('po_date')) or now(),
+                      'deadline': parse_date(row.get('deadline')),
+                      'status': 'Draft', 'notes': row.get('notes', ''),
+                      'created_by': user['name'], 'created_at': now(), 'updated_at': now()}
+                await db.production_pos.insert_one(po)
+                for item in row.get('items', []):
+                    await db.po_items.insert_one({
+                        'id': new_id(), 'po_id': po_id, 'po_number': row['po_number'],
+                        'product_name': item.get('product_name', ''),
+                        'sku': item.get('sku', ''), 'size': item.get('size', ''),
+                        'color': item.get('color', ''), 'serial_number': item.get('serial_number', ''),
+                        'qty': int(item.get('qty', 0) or 0),
+                        'selling_price_snapshot': float(item.get('selling_price', 0) or 0),
+                        'cmt_price_snapshot': float(item.get('cmt_price', 0) or 0),
+                        'created_at': now()})
+                imported += 1
+            except Exception as e: errors.append(f"Row {imported+1}: {str(e)}")
+    elif import_type == 'accessories':
+        for row in data_rows:
+            try:
+                await db.accessories.insert_one({'id': new_id(), 'name': row.get('name', ''),
+                    'code': row.get('code', ''), 'category': row.get('category', ''),
+                    'unit': row.get('unit', 'pcs'), 'description': row.get('description', ''),
+                    'status': 'active', 'created_at': now(), 'updated_at': now()})
+                imported += 1
+            except Exception as e: errors.append(f"Row {imported+1}: {str(e)}")
+    else:
+        raise HTTPException(400, f"Unknown import type: {import_type}")
+    await log_activity(user['id'], user['name'], 'Import', import_type, f"Imported {imported} records")
+    return {'imported': imported, 'errors': errors, 'type': import_type}
+
+@api.get("/import-template")
+async def import_template(request: Request):
+    require_auth(request)
+    ttype = request.query_params.get('type', '')
+    templates = {
+        'products': {'columns': ['product_code', 'product_name', 'category', 'cmt_price', 'selling_price'],
+                     'variant_columns': ['sku', 'size', 'color'], 'example': {'product_code': 'PRD-001', 'product_name': 'T-Shirt Basic', 'category': 'Shirt', 'cmt_price': 5000, 'selling_price': 15000}},
+        'garments': {'columns': ['garment_code', 'garment_name', 'location', 'contact_person', 'phone', 'monthly_capacity'],
+                     'example': {'garment_code': 'VND-001', 'garment_name': 'PT Garmen Jaya', 'location': 'Jakarta', 'contact_person': 'Budi', 'phone': '08123456789'}},
+        'production-pos': {'columns': ['po_number', 'customer_name', 'vendor_id', 'po_date', 'deadline', 'notes'],
+                           'item_columns': ['product_name', 'sku', 'size', 'color', 'serial_number', 'qty', 'selling_price', 'cmt_price'],
+                           'example': {'po_number': 'PO-001', 'customer_name': 'Buyer Corp'}},
+        'accessories': {'columns': ['code', 'name', 'category', 'unit', 'description'],
+                        'example': {'code': 'ACC-001', 'name': 'Kancing', 'category': 'Trimming', 'unit': 'pcs'}},
+    }
+    if ttype not in templates:
+        return {'available_types': list(templates.keys())}
+    return templates[ttype]
+
+# ─── EXPORT EXCEL ────────────────────────────────────────────────────────────
+@api.get("/export-excel")
+async def export_excel(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    export_type = sp.get('type', '')
+    try:
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        if export_type == 'production-pos':
+            ws.title = "Production POs"
+            headers = ['No', 'PO Number', 'Customer', 'Vendor', 'PO Date', 'Deadline', 'Status', 'Serial', 'SKU', 'Product', 'Size', 'Color', 'Qty', 'Selling Price', 'CMT Price']
+            ws.append(headers)
+            pos = await db.production_pos.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+            row_num = 1
+            for po in pos:
+                items = await db.po_items.find({'po_id': po['id']}).to_list(None)
+                for item in items:
+                    ws.append([row_num, po.get('po_number'), po.get('customer_name'), po.get('vendor_name'),
+                               str(po.get('po_date', ''))[:10], str(po.get('deadline', ''))[:10], po.get('status'),
+                               item.get('serial_number', ''), item.get('sku', ''), item.get('product_name', ''),
+                               item.get('size', ''), item.get('color', ''), item.get('qty', 0),
+                               item.get('selling_price_snapshot', 0), item.get('cmt_price_snapshot', 0)])
+                    row_num += 1
+        elif export_type == 'vendor-shipments':
+            ws.title = "Vendor Shipments"
+            headers = ['No', 'Shipment Number', 'Vendor', 'Type', 'Date', 'Status', 'Inspection', 'SKU', 'Product', 'Size', 'Color', 'Qty Sent', 'Ordered Qty']
+            ws.append(headers)
+            ships = await db.vendor_shipments.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+            row_num = 1
+            for s in ships:
+                items = await db.vendor_shipment_items.find({'shipment_id': s['id']}).to_list(None)
+                for item in items:
+                    ws.append([row_num, s.get('shipment_number'), s.get('vendor_name'), s.get('shipment_type', 'NORMAL'),
+                               str(s.get('shipment_date', ''))[:10], s.get('status'), s.get('inspection_status', 'Pending'),
+                               item.get('sku', ''), item.get('product_name', ''), item.get('size', ''), item.get('color', ''),
+                               item.get('qty_sent', 0), item.get('ordered_qty', 0)])
+                    row_num += 1
+        elif export_type == 'buyer-shipments':
+            ws.title = "Buyer Shipments"
+            headers = ['No', 'Shipment Number', 'PO Number', 'Customer', 'Vendor', 'Dispatch #', 'Dispatch Date', 'SKU', 'Product', 'Serial', 'Size', 'Color', 'Ordered Qty', 'Shipped Qty']
+            ws.append(headers)
+            ships = await db.buyer_shipments.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+            row_num = 1
+            for s in ships:
+                items = await db.buyer_shipment_items.find({'shipment_id': s['id']}).sort([('dispatch_seq', 1)]).to_list(None)
+                for item in items:
+                    ws.append([row_num, s.get('shipment_number'), s.get('po_number'), s.get('customer_name'),
+                               s.get('vendor_name'), item.get('dispatch_seq', 1), str(item.get('dispatch_date', ''))[:10],
+                               item.get('sku', ''), item.get('product_name', ''), item.get('serial_number', ''),
+                               item.get('size', ''), item.get('color', ''), item.get('ordered_qty', 0), item.get('qty_shipped', 0)])
+                    row_num += 1
+        elif export_type == 'invoices':
+            ws.title = "Invoices"
+            headers = ['No', 'Invoice Number', 'Category', 'PO Number', 'Vendor/Customer', 'Total Amount', 'Total Paid', 'Remaining', 'Status', 'Created']
+            ws.append(headers)
+            invs = await db.invoices.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+            for idx, inv in enumerate(invs, 1):
+                ws.append([idx, inv.get('invoice_number'), inv.get('invoice_category'),
+                           inv.get('po_number'), inv.get('vendor_or_customer_name', inv.get('vendor_name', '')),
+                           inv.get('total_amount', 0), inv.get('total_paid', 0),
+                           inv.get('remaining_balance', inv.get('total_amount', 0) - inv.get('total_paid', 0)),
+                           inv.get('status'), str(inv.get('created_at', ''))[:10]])
+        elif export_type == 'accessories':
+            ws.title = "Accessories"
+            headers = ['No', 'Code', 'Name', 'Category', 'Unit', 'Status']
+            ws.append(headers)
+            accs = await db.accessories.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+            for idx, acc in enumerate(accs, 1):
+                ws.append([idx, acc.get('code'), acc.get('name'), acc.get('category'), acc.get('unit'), acc.get('status')])
+        elif export_type == 'production-report':
+            ws.title = "Production Report"
+            headers = ['No', 'Date', 'PO Number', 'Serial', 'Product Code', 'Product Name', 'Size', 'SKU', 'Color',
+                       'Output Qty', 'Selling Price', 'CMT Price', 'Total Sales', 'Total CMT', 'Vendor', 'Notes',
+                       'Qty Produced', 'Qty Not Produced', 'Qty Shipped']
+            ws.append(headers)
+            pos = await db.production_pos.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+            row_num = 1
+            for po in pos:
+                items = await db.po_items.find({'po_id': po['id']}).to_list(None)
+                for item in items:
+                    ji_list = await db.production_job_items.find({'po_item_id': item['id']}).to_list(None)
+                    produced = sum(j.get('produced_qty', 0) for j in ji_list)
+                    bi_list = await db.buyer_shipment_items.find({'po_item_id': item['id']}).to_list(None)
+                    shipped = sum(b.get('qty_shipped', 0) for b in bi_list)
+                    qty = item.get('qty', 0)
+                    sp_price = item.get('selling_price_snapshot', 0)
+                    cmt = item.get('cmt_price_snapshot', 0)
+                    ws.append([row_num, str(po.get('po_date', po.get('created_at', '')))[:10],
+                               po.get('po_number'), item.get('serial_number', ''), item.get('sku', ''),
+                               item.get('product_name', ''), item.get('size', ''), item.get('sku', ''),
+                               item.get('color', ''), qty, sp_price, cmt, qty * sp_price, qty * cmt,
+                               po.get('vendor_name', ''), po.get('notes', ''),
+                               produced, max(0, qty - produced), shipped])
+                    row_num += 1
+        else:
+            return JSONResponse({'error': f'Unknown export type: {export_type}', 'available_types': [
+                'production-pos', 'vendor-shipments', 'buyer-shipments', 'invoices', 'accessories', 'production-report']}, status_code=400)
+        buf = BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        filename = f"{export_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 headers={"Content-Disposition": f"attachment; filename={filename}"})
+    except Exception as e:
+        logger.error(f"Export error: {e}")
+        raise HTTPException(500, f"Export failed: {str(e)}")
+
+# ─── EXPORT PDF ──────────────────────────────────────────────────────────────
+# PDF helper utilities
+def _pdf_styles():
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name='SmallCell', fontSize=7, leading=9, wordWrap='LTR'))
+    styles.add(ParagraphStyle(name='SmallCellBold', fontSize=7, leading=9, fontName='Helvetica-Bold', wordWrap='LTR'))
+    return styles
+
+def _pdf_table_style():
+    from reportlab.lib import colors
+    from reportlab.platypus import TableStyle
+    return TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#334155')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e1')),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f8fafc')]),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+    ])
+
+def _pdf_total_row_style():
+    from reportlab.lib import colors
+    from reportlab.platypus import TableStyle
+    return TableStyle([
+        ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#f1f5f9')),
+        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+    ])
+
+def _build_pdf(buf, elements, page=None):
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate
+    ps = landscape(A4) if page == 'landscape' else A4
+    doc = SimpleDocTemplate(buf, pagesize=ps, leftMargin=12*mm, rightMargin=12*mm, topMargin=12*mm, bottomMargin=12*mm)
+    doc.build(elements)
+    buf.seek(0)
+    return buf
+
+def _pdf_header(elements, company_name, title, subtitle=None, info_pairs=None):
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.units import mm
+    styles = _pdf_styles()
+    elements.append(Paragraph(f"<b>{company_name}</b>", styles['Title']))
+    elements.append(Paragraph(title, styles['Heading2']))
+    if subtitle:
+        elements.append(Paragraph(subtitle, styles['Normal']))
+    elements.append(Spacer(1, 4*mm))
+    if info_pairs:
+        info_data = []
+        row = []
+        for i, (k, v) in enumerate(info_pairs):
+            row.extend([f"{k}:", str(v or '-')])
+            if len(row) >= 4 or i == len(info_pairs) - 1:
+                while len(row) < 4: row.append('')
+                info_data.append(row)
+                row = []
+        if info_data:
+            it = Table(info_data, colWidths=[85, 180, 85, 180])
+            it.setStyle(TableStyle([('FONTSIZE', (0, 0), (-1, -1), 9), ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'), ('FONTNAME', (2, 0), (2, -1), 'Helvetica-Bold')]))
+            elements.append(it)
+            elements.append(Spacer(1, 5*mm))
+    return elements
+
+def _pdf_footer(elements):
+    from reportlab.platypus import Paragraph, Spacer
+    from reportlab.lib.units import mm
+    styles = _pdf_styles()
+    elements.append(Spacer(1, 8*mm))
+    elements.append(Paragraph(f"<i>Generated: {datetime.now().strftime('%d/%m/%Y %H:%M')}</i>", styles['Normal']))
+    return elements
+
+def _safe_str(v, max_len=40):
+    s = str(v or '')
+    return s[:max_len] if len(s) > max_len else s
+
+def _fmt_date(v):
+    if not v: return '-'
+    s = str(v)[:10]
+    return s if s != 'None' else '-'
+
+def _fmt_num(v):
+    try:
+        return f"{int(v):,}".replace(',', '.')
+    except (ValueError, TypeError):
+        return str(v or 0)
+
+def _fmt_money(v):
+    try:
+        return f"Rp {int(v):,}".replace(',', '.')
+    except (ValueError, TypeError):
+        return 'Rp 0'
+
+# ─── PDF Export Config helpers ─────────────────────────────────────────────
+async def _get_pdf_config(db, pdf_type, config_id=None):
+    """Get PDF export config (custom columns) if exists."""
+    if config_id:
+        cfg = await db.pdf_export_configs.find_one({'id': config_id})
+        if cfg:
+            return cfg
+    # Try default for this type
+    cfg = await db.pdf_export_configs.find_one({'pdf_type': pdf_type, 'is_default': True})
+    return cfg
+
+def _filter_columns(headers, all_col_keys, selected_keys, data_rows):
+    """Filter table columns based on selected keys from config."""
+    if not selected_keys:
+        return headers, data_rows
+    indices = [i for i, k in enumerate(all_col_keys) if k in selected_keys]
+    if not indices:
+        return headers, data_rows
+    new_headers = [headers[i] for i in indices]
+    new_rows = [[row[i] if i < len(row) else '' for i in indices] for row in data_rows]
+    return new_headers, new_rows
+
+@api.get("/export-pdf")
+async def export_pdf(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    pdf_type = sp.get('type', '')
+    config_id = sp.get('config_id')
+    try:
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib import colors
+        from reportlab.lib.units import mm
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib.styles import getSampleStyleSheet
+        buf = BytesIO()
+        styles = _pdf_styles()
+        settings = await db.company_settings.find_one({'type': 'general'}) or {}
+        company_name = settings.get('company_name', 'Garment ERP')
+        pdf_header_1 = settings.get('pdf_header_line1', '')
+        pdf_header_2 = settings.get('pdf_header_line2', '')
+        pdf_footer = settings.get('pdf_footer_text', '')
+
+        # Get optional custom column config
+        config = await _get_pdf_config(db, pdf_type, config_id)
+
+        # ──── PRODUCTION PO (SPP - Surat Perintah Produksi) ────
+        if pdf_type == 'production-po':
+            po_id = sp.get('id')
+            if not po_id: raise HTTPException(400, 'id required')
+            po = await db.production_pos.find_one({'id': po_id}, {'_id': 0})
+            if not po: raise HTTPException(404, 'PO not found')
+            items = await db.po_items.find({'po_id': po_id}, {'_id': 0}).to_list(None)
+            if not items: raise HTTPException(404, 'No items in this PO')
+            accessories = await db.po_accessories.find({'po_id': po_id}, {'_id': 0}).to_list(None)
+            elements = []
+            _pdf_header(elements, company_name, 'Surat Perintah Produksi (SPP)', info_pairs=[
+                ('No PO', po.get('po_number', '')), ('Customer', po.get('customer_name', '')),
+                ('Vendor', po.get('vendor_name', '')), ('Status', po.get('status', '')),
+                ('Tanggal PO', _fmt_date(po.get('po_date'))), ('Deadline', _fmt_date(po.get('deadline'))),
+                ('Delivery Deadline', _fmt_date(po.get('delivery_deadline'))),
+            ])
+            # Items table
+            all_col_keys = ['no', 'serial', 'product', 'sku', 'size', 'color', 'qty', 'price', 'cmt']
+            headers = ['No', 'Serial No', 'Product', 'SKU', 'Size', 'Color', 'Qty', 'Price', 'CMT']
+            data_rows = []
+            for idx, item in enumerate(items, 1):
+                data_rows.append([
+                    idx, _safe_str(item.get('serial_number')), _safe_str(item.get('product_name')),
+                    _safe_str(item.get('sku')), _safe_str(item.get('size')), _safe_str(item.get('color')),
+                    item.get('qty', 0), _fmt_money(item.get('selling_price_snapshot', 0)),
+                    _fmt_money(item.get('cmt_price_snapshot', 0))
+                ])
+            if config and config.get('columns'):
+                headers, data_rows = _filter_columns(headers, all_col_keys, config['columns'], data_rows)
+            td = [headers] + data_rows
+            total_qty = sum(i.get('qty', 0) for i in items)
+            total_row = [''] * len(headers)
+            total_row[-3] = 'TOTAL'
+            total_row[-2] = total_qty if 'qty' in (config or {}).get('columns', all_col_keys) else ''
+            td.append(total_row)
+            cw = [max(25, int(530 / len(headers)))] * len(headers)
+            t = Table(td, colWidths=cw, repeatRows=1)
+            t.setStyle(_pdf_table_style())
+            t.setStyle(_pdf_total_row_style())
+            elements.append(t)
+            # Accessories section
+            if accessories:
+                elements.append(Spacer(1, 6*mm))
+                elements.append(Paragraph("<b>Accessories Required:</b>", styles['Heading3']))
+                acc_td = [['No', 'Accessory', 'Code', 'Qty Needed', 'Unit', 'Notes']]
+                for idx, acc in enumerate(accessories, 1):
+                    acc_td.append([idx, acc.get('accessory_name', ''), acc.get('accessory_code', ''),
+                                   acc.get('qty_needed', 0), acc.get('unit', 'pcs'), _safe_str(acc.get('notes', ''))])
+                at = Table(acc_td, colWidths=[25, 120, 80, 70, 50, 120])
+                at.setStyle(_pdf_table_style())
+                elements.append(at)
+            if po.get('notes'):
+                elements.append(Spacer(1, 4*mm))
+                elements.append(Paragraph(f"<b>Notes:</b> {po.get('notes', '')}", styles['Normal']))
+            _pdf_footer(elements)
+            _build_pdf(buf, elements, page='landscape')
+            fname = f"SPP-{po.get('po_number', 'unknown')}.pdf"
+            return StreamingResponse(buf, media_type="application/pdf",
+                                     headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+        # ──── VENDOR SHIPMENT (Surat Jalan Material) ────
+        elif pdf_type == 'vendor-shipment':
+            sid = sp.get('id')
+            if not sid: raise HTTPException(400, 'id required')
+            ship = await db.vendor_shipments.find_one({'id': sid}, {'_id': 0})
+            if not ship: raise HTTPException(404, 'Shipment not found')
+            items = await db.vendor_shipment_items.find({'shipment_id': sid}, {'_id': 0}).to_list(None)
+            elements = []
+            _pdf_header(elements, company_name, 'Surat Jalan Material (Vendor Shipment)', info_pairs=[
+                ('Shipment No', ship.get('shipment_number', '')), ('Vendor', ship.get('vendor_name', '')),
+                ('Type', ship.get('shipment_type', 'NORMAL')), ('Status', ship.get('status', '')),
+                ('Date', _fmt_date(ship.get('shipment_date'))),
+                ('Inspection', ship.get('inspection_status', 'Pending')),
+            ])
+            all_col_keys = ['no', 'po', 'serial', 'product', 'sku', 'size', 'color', 'qty_sent']
+            headers = ['No', 'PO', 'Serial', 'Product', 'SKU', 'Size', 'Color', 'Qty Sent']
+            data_rows = []
+            for idx, i in enumerate(items, 1):
+                data_rows.append([idx, _safe_str(i.get('po_number')), _safe_str(i.get('serial_number')),
+                    _safe_str(i.get('product_name')), _safe_str(i.get('sku')),
+                    _safe_str(i.get('size')), _safe_str(i.get('color')), i.get('qty_sent', 0)])
+            if config and config.get('columns'):
+                headers, data_rows = _filter_columns(headers, all_col_keys, config['columns'], data_rows)
+            td = [headers] + data_rows
+            total_row = [''] * len(headers)
+            total_row[-2] = 'TOTAL'
+            total_row[-1] = sum(i.get('qty_sent', 0) for i in items)
+            td.append(total_row)
+            cw = [max(25, int(445 / len(headers)))] * len(headers)
+            t = Table(td, colWidths=cw, repeatRows=1)
+            t.setStyle(_pdf_table_style())
+            t.setStyle(_pdf_total_row_style())
+            elements.append(t)
+            # Signature area
+            elements.append(Spacer(1, 15*mm))
+            sig_data = [['Pengirim (Vendor)', '', 'Penerima'], ['', '', ''], ['_________________', '', '_________________']]
+            st = Table(sig_data, colWidths=[180, 100, 180])
+            st.setStyle(TableStyle([('ALIGN', (0, 0), (-1, -1), 'CENTER'), ('FONTSIZE', (0, 0), (-1, -1), 9)]))
+            elements.append(st)
+            _pdf_footer(elements)
+            _build_pdf(buf, elements)
+            return StreamingResponse(buf, media_type="application/pdf",
+                                     headers={"Content-Disposition": f"attachment; filename=SJ-Material-{ship.get('shipment_number','')}.pdf"})
+
+        # ──── BUYER SHIPMENT DISPATCH ────
+        elif pdf_type == 'buyer-shipment-dispatch':
+            shipment_id = sp.get('shipment_id')
+            dispatch_seq = int(sp.get('dispatch_seq', 0))
+            if not shipment_id or not dispatch_seq:
+                raise HTTPException(400, 'shipment_id and dispatch_seq required')
+            bs = await db.buyer_shipments.find_one({'id': shipment_id}, {'_id': 0})
+            if not bs: raise HTTPException(404, 'Buyer shipment not found')
+            items = await db.buyer_shipment_items.find({
+                'shipment_id': shipment_id, 'dispatch_seq': dispatch_seq
+            }, {'_id': 0}).to_list(None)
+            if not items: raise HTTPException(404, f'No items for dispatch #{dispatch_seq}')
+            all_items = await db.buyer_shipment_items.find({'shipment_id': shipment_id}).to_list(None)
+            cumulative_by_poi = {}
+            for ai in all_items:
+                key = ai.get('po_item_id') or ai['id']
+                if key not in cumulative_by_poi:
+                    cumulative_by_poi[key] = {'ordered': ai.get('ordered_qty', 0), 'shipped': 0}
+                if ai.get('dispatch_seq', 1) <= dispatch_seq:
+                    cumulative_by_poi[key]['shipped'] += ai.get('qty_shipped', 0)
+            elements = []
+            _pdf_header(elements, company_name, f'Surat Jalan Buyer — Dispatch #{dispatch_seq}', info_pairs=[
+                ('Shipment No', bs.get('shipment_number', '')), ('PO Number', bs.get('po_number', '')),
+                ('Customer', bs.get('customer_name', '')), ('Vendor', bs.get('vendor_name', '')),
+                ('Dispatch Date', _fmt_date(items[0].get('dispatch_date', ''))), ('Dispatch #', str(dispatch_seq)),
+            ])
+            all_col_keys = ['no', 'serial', 'product', 'sku', 'size', 'color', 'ordered', 'this_dispatch', 'cumul_shipped', 'remaining']
+            headers = ['No', 'Serial', 'Product', 'SKU', 'Size', 'Color', 'Ordered', 'This Dispatch', 'Cumul. Shipped', 'Remaining']
+            data_rows = []
+            for idx, item in enumerate(items, 1):
+                key = item.get('po_item_id') or item['id']
+                cum = cumulative_by_poi.get(key, {'ordered': 0, 'shipped': 0})
+                data_rows.append([
+                    idx, _safe_str(item.get('serial_number')), _safe_str(item.get('product_name')),
+                    _safe_str(item.get('sku')), _safe_str(item.get('size')), _safe_str(item.get('color')),
+                    item.get('ordered_qty', 0), item.get('qty_shipped', 0), cum['shipped'],
+                    max(0, cum['ordered'] - cum['shipped'])
+                ])
+            if config and config.get('columns'):
+                headers, data_rows = _filter_columns(headers, all_col_keys, config['columns'], data_rows)
+            td = [headers] + data_rows
+            total_this = sum(i.get('qty_shipped', 0) for i in items)
+            total_cum = sum(v['shipped'] for v in cumulative_by_poi.values())
+            total_ord = sum(v['ordered'] for v in cumulative_by_poi.values())
+            total_row = [''] * len(headers)
+            if len(total_row) >= 4:
+                total_row[-4] = total_ord
+                total_row[-3] = total_this
+                total_row[-2] = total_cum
+                total_row[-1] = max(0, total_ord - total_cum)
+                total_row[-5] = 'TOTAL' if len(total_row) > 5 else ''
+            td.append(total_row)
+            cw = [max(25, int(680 / len(headers)))] * len(headers)
+            t = Table(td, colWidths=cw, repeatRows=1)
+            t.setStyle(_pdf_table_style())
+            t.setStyle(_pdf_total_row_style())
+            t.setStyle(TableStyle([('ALIGN', (6, 0), (-1, -1), 'RIGHT')]))
+            elements.append(t)
+            _pdf_footer(elements)
+            _build_pdf(buf, elements, page='landscape')
+            fname = f"buyer_dispatch_{bs.get('shipment_number','')}_D{dispatch_seq}.pdf"
+            return StreamingResponse(buf, media_type="application/pdf",
+                                     headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+        # ──── BUYER SHIPMENT (Summary - all dispatches) ────
+        elif pdf_type == 'buyer-shipment':
+            sid = sp.get('id')
+            if not sid: raise HTTPException(400, 'id required')
+            bs = await db.buyer_shipments.find_one({'id': sid}, {'_id': 0})
+            if not bs: raise HTTPException(404, 'Buyer shipment not found')
+            all_items = await db.buyer_shipment_items.find({'shipment_id': sid}, {'_id': 0}).to_list(None)
+            elements = []
+            _pdf_header(elements, company_name, 'Surat Jalan Buyer — Summary', info_pairs=[
+                ('Shipment No', bs.get('shipment_number', '')), ('PO Number', bs.get('po_number', '')),
+                ('Customer', bs.get('customer_name', '')), ('Vendor', bs.get('vendor_name', '')),
+                ('Status', bs.get('status', bs.get('ship_status', ''))),
+            ])
+            # Group by dispatch
+            dispatches = {}
+            for item in all_items:
+                ds = item.get('dispatch_seq', 1)
+                if ds not in dispatches:
+                    dispatches[ds] = []
+                dispatches[ds].append(item)
+            if not dispatches:
+                elements.append(Paragraph("No dispatch items found for this shipment.", styles['Normal']))
+            for ds in sorted(dispatches.keys()):
+                d_items = dispatches[ds]
+                elements.append(Paragraph(f"<b>Dispatch #{ds}</b> — {_fmt_date(d_items[0].get('dispatch_date', ''))}", styles['Heading3']))
+                elements.append(Spacer(1, 2*mm))
+                td = [['No', 'Serial', 'Product', 'SKU', 'Size', 'Color', 'Ordered', 'Shipped']]
+                for idx, item in enumerate(d_items, 1):
+                    td.append([idx, _safe_str(item.get('serial_number')), _safe_str(item.get('product_name')),
+                               _safe_str(item.get('sku')), _safe_str(item.get('size')), _safe_str(item.get('color')),
+                               item.get('ordered_qty', 0), item.get('qty_shipped', 0)])
+                total_row = ['', '', '', '', '', 'TOTAL', sum(i.get('ordered_qty', 0) for i in d_items), sum(i.get('qty_shipped', 0) for i in d_items)]
+                td.append(total_row)
+                cw = [25, 60, 100, 70, 40, 50, 55, 55]
+                t = Table(td, colWidths=cw, repeatRows=1)
+                t.setStyle(_pdf_table_style())
+                t.setStyle(_pdf_total_row_style())
+                elements.append(t)
+                elements.append(Spacer(1, 5*mm))
+            _pdf_footer(elements)
+            _build_pdf(buf, elements, page='landscape')
+            fname = f"Buyer-Shipment-{bs.get('shipment_number', sid)}.pdf"
+            return StreamingResponse(buf, media_type="application/pdf",
+                                     headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+        # ──── PRODUCTION RETURN ────
+        elif pdf_type == 'production-return':
+            rid = sp.get('id')
+            if not rid: raise HTTPException(400, 'id required')
+            ret = await db.production_returns.find_one({'id': rid}, {'_id': 0})
+            if not ret: raise HTTPException(404, 'Production return not found')
+            items = await db.production_return_items.find({'return_id': rid}, {'_id': 0}).to_list(None)
+            elements = []
+            _pdf_header(elements, company_name, 'Surat Retur Produksi', info_pairs=[
+                ('Return No', ret.get('return_number', '')), ('PO Number', ret.get('reference_po_number', '')),
+                ('Customer', ret.get('customer_name', '')), ('Status', ret.get('status', '')),
+                ('Return Date', _fmt_date(ret.get('return_date'))), ('Reason', _safe_str(ret.get('return_reason', ''), 60)),
+            ])
+            if items:
+                td = [['No', 'Serial', 'Product', 'SKU', 'Size', 'Color', 'Qty Returned', 'Notes']]
+                for idx, i in enumerate(items, 1):
+                    td.append([idx, _safe_str(i.get('serial_number')), _safe_str(i.get('product_name')),
+                               _safe_str(i.get('sku')), _safe_str(i.get('size')), _safe_str(i.get('color')),
+                               i.get('return_qty', 0), _safe_str(i.get('notes', ''), 30)])
+                total_row = ['', '', '', '', '', 'TOTAL', sum(i.get('return_qty', 0) for i in items), '']
+                td.append(total_row)
+                cw = [25, 60, 100, 70, 40, 50, 65, 80]
+                t = Table(td, colWidths=cw, repeatRows=1)
+                t.setStyle(_pdf_table_style())
+                t.setStyle(_pdf_total_row_style())
+                elements.append(t)
+            else:
+                elements.append(Paragraph("No return items found.", styles['Normal']))
+            if ret.get('notes'):
+                elements.append(Spacer(1, 4*mm))
+                elements.append(Paragraph(f"<b>Notes:</b> {ret.get('notes', '')}", styles['Normal']))
+            _pdf_footer(elements)
+            _build_pdf(buf, elements)
+            fname = f"Retur-{ret.get('return_number', rid)}.pdf"
+            return StreamingResponse(buf, media_type="application/pdf",
+                                     headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+        # ──── MATERIAL REQUEST ────
+        elif pdf_type == 'material-request':
+            req_id = sp.get('id')
+            if not req_id: raise HTTPException(400, 'id required')
+            req = await db.material_requests.find_one({'id': req_id}, {'_id': 0})
+            if not req: raise HTTPException(404, 'Material request not found')
+            elements = []
+            req_type = req.get('request_type', 'ADDITIONAL')
+            _pdf_header(elements, company_name, f'Surat Permohonan Material ({req_type})', info_pairs=[
+                ('Request No', req.get('request_number', '')), ('PO Number', req.get('po_number', '')),
+                ('Vendor', req.get('vendor_name', '')), ('Status', req.get('status', '')),
+                ('Total Qty', req.get('total_requested_qty', 0)),
+                ('Child Shipment', req.get('child_shipment_number', '-')),
+            ])
+            # Request items if available
+            req_items = req.get('items', [])
+            if req_items:
+                td = [['No', 'Serial', 'Product', 'SKU', 'Size', 'Color', 'Qty Requested']]
+                for idx, i in enumerate(req_items, 1):
+                    td.append([idx, _safe_str(i.get('serial_number')), _safe_str(i.get('product_name')),
+                               _safe_str(i.get('sku')), _safe_str(i.get('size')), _safe_str(i.get('color')),
+                               i.get('qty_requested', i.get('requested_qty', 0))])
+                cw = [25, 65, 110, 75, 45, 55, 70]
+                t = Table(td, colWidths=cw, repeatRows=1)
+                t.setStyle(_pdf_table_style())
+                elements.append(t)
+            else:
+                elements.append(Paragraph(f"Total Requested Quantity: <b>{req.get('total_requested_qty', 0)}</b>", styles['Normal']))
+            if req.get('reason'):
+                elements.append(Spacer(1, 4*mm))
+                elements.append(Paragraph(f"<b>Reason:</b> {req.get('reason', '')}", styles['Normal']))
+            # Approval signatures
+            elements.append(Spacer(1, 15*mm))
+            sig_data = [['Diajukan oleh:', '', 'Disetujui oleh:'], ['', '', ''], ['_________________', '', '_________________']]
+            st = Table(sig_data, colWidths=[180, 100, 180])
+            st.setStyle(TableStyle([('ALIGN', (0, 0), (-1, -1), 'CENTER'), ('FONTSIZE', (0, 0), (-1, -1), 9)]))
+            elements.append(st)
+            _pdf_footer(elements)
+            _build_pdf(buf, elements)
+            fname = f"Permohonan-{req.get('request_number', req_id)}.pdf"
+            return StreamingResponse(buf, media_type="application/pdf",
+                                     headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+        # ──── PRODUCTION REPORT (full) ────
+        elif pdf_type == 'production-report':
+            elements = []
+            _pdf_header(elements, company_name, 'Laporan Produksi Lengkap')
+            pos = await db.production_pos.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+            all_col_keys = ['no', 'date', 'po', 'serial', 'product', 'sku', 'size', 'color', 'qty', 'price', 'cmt', 'vendor', 'produced', 'shipped']
+            headers = ['No', 'Date', 'PO', 'Serial', 'Product', 'SKU', 'Size', 'Color', 'Qty', 'Price', 'CMT', 'Vendor', 'Produced', 'Shipped']
+            data_rows = []
+            rn = 1
+            for po in pos:
+                items = await db.po_items.find({'po_id': po['id']}).to_list(None)
+                for item in items:
+                    ji = await db.production_job_items.find({'po_item_id': item['id']}).to_list(None)
+                    produced = sum(j.get('produced_qty', 0) for j in ji)
+                    bi = await db.buyer_shipment_items.find({'po_item_id': item['id']}).to_list(None)
+                    shipped = sum(b.get('qty_shipped', 0) for b in bi)
+                    data_rows.append([rn, _fmt_date(po.get('po_date')), _safe_str(po.get('po_number'), 15),
+                        _safe_str(item.get('serial_number'), 15), _safe_str(item.get('product_name'), 20),
+                        _safe_str(item.get('sku'), 15), _safe_str(item.get('size'), 8), _safe_str(item.get('color'), 10),
+                        item.get('qty', 0), _fmt_money(item.get('selling_price_snapshot', 0)),
+                        _fmt_money(item.get('cmt_price_snapshot', 0)),
+                        _safe_str(po.get('vendor_name'), 15), produced, shipped])
+                    rn += 1
+            if config and config.get('columns'):
+                headers, data_rows = _filter_columns(headers, all_col_keys, config['columns'], data_rows)
+            if not data_rows:
+                elements.append(Paragraph("No production data found.", styles['Normal']))
+            else:
+                td = [headers] + data_rows
+                cw = [max(22, int(680 / len(headers)))] * len(headers)
+                t = Table(td, colWidths=cw, repeatRows=1)
+                t.setStyle(_pdf_table_style())
+                t.setStyle(TableStyle([('FONTSIZE', (0, 0), (-1, -1), 7)]))
+                elements.append(t)
+            _pdf_footer(elements)
+            _build_pdf(buf, elements, page='landscape')
+            return StreamingResponse(buf, media_type="application/pdf",
+                                     headers={"Content-Disposition": f"attachment; filename=production_report_{datetime.now().strftime('%Y%m%d')}.pdf"})
+
+        # ──── REPORT-* (Reuse /api/reports/{type} query logic) ────
+        elif pdf_type.startswith('report-'):
+            report_type = pdf_type[7:]  # strip 'report-' prefix
+            valid_report_types = ['production', 'progress', 'financial', 'shipment', 'defect', 'return', 'missing-material', 'replacement', 'accessory']
+            if report_type not in valid_report_types:
+                return JSONResponse({'error': f'Unknown report type: {report_type}', 'available': valid_report_types}, status_code=400)
+
+            # ── Get report data by reusing the same query logic as /api/reports/{type} ──
+            report_data = []
+
+            if report_type == 'production':
+                po_query = {}
+                if sp.get('status'): po_query['status'] = sp['status']
+                pos = await db.production_pos.find(po_query, {'_id': 0}).sort('created_at', -1).to_list(None)
+                for po in pos:
+                    if sp.get('vendor_id') and po.get('vendor_id') != sp['vendor_id']: continue
+                    items = await db.po_items.find({'po_id': po['id']}).to_list(None)
+                    for item in items:
+                        if sp.get('serial_number') and item.get('serial_number') != sp['serial_number']: continue
+                        report_data.append({
+                            'tanggal': _fmt_date(po.get('po_date', po.get('created_at'))),
+                            'no_po': po.get('po_number', ''), 'no_seri': item.get('serial_number', ''),
+                            'nama_produk': item.get('product_name', ''), 'sku': item.get('sku', ''),
+                            'size': item.get('size', ''), 'warna': item.get('color', ''),
+                            'output_qty': item.get('qty', 0),
+                            'harga': item.get('selling_price_snapshot', 0), 'hpp': item.get('cmt_price_snapshot', 0),
+                            'garment': po.get('vendor_name', ''), 'po_status': po.get('status', ''),
+                        })
+                headers = ['No', 'Tanggal', 'No PO', 'Serial', 'Produk', 'SKU', 'Size', 'Warna', 'Qty', 'Harga', 'HPP/CMT', 'Vendor', 'Status']
+                all_col_keys = ['no', 'tanggal', 'no_po', 'no_seri', 'nama_produk', 'sku', 'size', 'warna', 'output_qty', 'harga', 'hpp', 'garment', 'po_status']
+
+            elif report_type == 'progress':
+                progs = await db.production_progress.find({}, {'_id': 0}).sort('progress_date', -1).to_list(None)
+                for p in progs:
+                    ji = await db.production_job_items.find_one({'id': p.get('job_item_id')}) if p.get('job_item_id') else None
+                    job = await db.production_jobs.find_one({'id': p.get('job_id')}) if p.get('job_id') else None
+                    if sp.get('vendor_id') and (job or {}).get('vendor_id') != sp['vendor_id']: continue
+                    report_data.append({
+                        'date': _fmt_date(p.get('progress_date')),
+                        'job_number': (job or {}).get('job_number', ''),
+                        'po_number': (job or {}).get('po_number', ''),
+                        'vendor_name': (job or {}).get('vendor_name', ''),
+                        'serial_number': (ji or {}).get('serial_number', ''),
+                        'sku': (ji or {}).get('sku', p.get('sku', '')),
+                        'product_name': (ji or {}).get('product_name', p.get('product_name', '')),
+                        'qty_progress': p.get('completed_quantity', 0),
+                        'notes': p.get('notes', ''), 'recorded_by': p.get('recorded_by', '')
+                    })
+                headers = ['No', 'Tanggal', 'Job', 'PO', 'Vendor', 'Serial', 'SKU', 'Produk', 'Qty', 'Catatan', 'Dicatat oleh']
+                all_col_keys = ['no', 'date', 'job_number', 'po_number', 'vendor_name', 'serial_number', 'sku', 'product_name', 'qty_progress', 'notes', 'recorded_by']
+
+            elif report_type == 'financial':
+                inv_query = {}
+                if sp.get('status'): inv_query['status'] = sp['status']
+                invoices = await db.invoices.find(inv_query, {'_id': 0}).sort('created_at', -1).to_list(None)
+                for inv in invoices:
+                    report_data.append({
+                        'invoice_number': inv.get('invoice_number', ''),
+                        'category': inv.get('invoice_category', ''),
+                        'po_number': inv.get('po_number', ''),
+                        'vendor_or_buyer': inv.get('vendor_name', inv.get('customer_name', '')),
+                        'amount': inv.get('amount', 0),
+                        'paid': inv.get('paid_amount', 0),
+                        'remaining': inv.get('remaining_amount', inv.get('amount', 0) - inv.get('paid_amount', 0)),
+                        'status': inv.get('status', ''),
+                        'date': _fmt_date(inv.get('invoice_date', inv.get('created_at'))),
+                    })
+                headers = ['No', 'Invoice No', 'Category', 'PO', 'Vendor/Buyer', 'Amount', 'Paid', 'Remaining', 'Status', 'Date']
+                all_col_keys = ['no', 'invoice_number', 'category', 'po_number', 'vendor_or_buyer', 'amount', 'paid', 'remaining', 'status', 'date']
+
+            elif report_type == 'shipment':
+                vs = await db.vendor_shipments.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+                bsh = await db.buyer_shipments.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+                for v in vs:
+                    if sp.get('vendor_id') and v.get('vendor_id') != sp['vendor_id']: continue
+                    items = await db.vendor_shipment_items.find({'shipment_id': v['id']}).to_list(None)
+                    report_data.append({
+                        'direction': 'VENDOR', 'shipment_number': v.get('shipment_number', ''),
+                        'shipment_type': v.get('shipment_type', 'NORMAL'), 'vendor_name': v.get('vendor_name', ''),
+                        'status': v.get('status', ''), 'inspection': v.get('inspection_status', 'Pending'),
+                        'date': _fmt_date(v.get('shipment_date', v.get('created_at'))),
+                        'total_qty': sum(i.get('qty_sent', 0) for i in items), 'items': len(items)
+                    })
+                for b in bsh:
+                    if sp.get('vendor_id') and b.get('vendor_id') != sp['vendor_id']: continue
+                    items = await db.buyer_shipment_items.find({'shipment_id': b['id']}).to_list(None)
+                    report_data.append({
+                        'direction': 'BUYER', 'shipment_number': b.get('shipment_number', ''),
+                        'shipment_type': 'NORMAL', 'vendor_name': b.get('vendor_name', ''),
+                        'status': b.get('status', b.get('ship_status', '')), 'inspection': '-',
+                        'date': _fmt_date(b.get('created_at')),
+                        'total_qty': sum(i.get('qty_shipped', 0) for i in items), 'items': len(items)
+                    })
+                headers = ['No', 'Direction', 'Shipment No', 'Type', 'Vendor', 'Status', 'Inspection', 'Date', 'Qty', 'Items']
+                all_col_keys = ['no', 'direction', 'shipment_number', 'shipment_type', 'vendor_name', 'status', 'inspection', 'date', 'total_qty', 'items']
+
+            elif report_type == 'defect':
+                defects = await db.material_defect_reports.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+                for d in defects:
+                    if sp.get('vendor_id') and d.get('vendor_id') != sp['vendor_id']: continue
+                    report_data.append({
+                        'date': _fmt_date(d.get('report_date', d.get('created_at'))),
+                        'sku': d.get('sku', ''), 'product_name': d.get('product_name', ''),
+                        'size': d.get('size', ''), 'color': d.get('color', ''),
+                        'defect_qty': d.get('defect_qty', 0), 'defect_type': d.get('defect_type', ''),
+                        'description': d.get('description', ''), 'status': d.get('status', '')
+                    })
+                headers = ['No', 'Tanggal', 'SKU', 'Produk', 'Size', 'Warna', 'Qty Defect', 'Tipe', 'Deskripsi', 'Status']
+                all_col_keys = ['no', 'date', 'sku', 'product_name', 'size', 'color', 'defect_qty', 'defect_type', 'description', 'status']
+
+            elif report_type == 'return':
+                returns = await db.production_returns.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+                for r in returns:
+                    items = await db.production_return_items.find({'return_id': r['id']}).to_list(None)
+                    report_data.append({
+                        'return_number': r.get('return_number', ''), 'po_number': r.get('reference_po_number', ''),
+                        'customer_name': r.get('customer_name', ''), 'return_date': _fmt_date(r.get('return_date')),
+                        'total_qty': sum(i.get('return_qty', 0) for i in items), 'item_count': len(items),
+                        'reason': r.get('return_reason', ''), 'status': r.get('status', ''),
+                    })
+                headers = ['No', 'Return No', 'PO', 'Customer', 'Date', 'Total Qty', 'Items', 'Reason', 'Status']
+                all_col_keys = ['no', 'return_number', 'po_number', 'customer_name', 'return_date', 'total_qty', 'item_count', 'reason', 'status']
+
+            elif report_type == 'missing-material':
+                reqs = await db.material_requests.find({'request_type': 'ADDITIONAL'}, {'_id': 0}).sort('created_at', -1).to_list(None)
+                for r in reqs:
+                    if sp.get('vendor_id') and r.get('vendor_id') != sp['vendor_id']: continue
+                    report_data.append({
+                        'request_number': r.get('request_number', ''), 'vendor_name': r.get('vendor_name', ''),
+                        'po_number': r.get('po_number', ''), 'total_qty': r.get('total_requested_qty', 0),
+                        'reason': r.get('reason', ''), 'status': r.get('status', ''),
+                        'child_shipment': r.get('child_shipment_number', '-'),
+                        'date': _fmt_date(r.get('created_at')),
+                    })
+                headers = ['No', 'Request No', 'Vendor', 'PO', 'Qty', 'Reason', 'Status', 'Child Shipment', 'Date']
+                all_col_keys = ['no', 'request_number', 'vendor_name', 'po_number', 'total_qty', 'reason', 'status', 'child_shipment', 'date']
+
+            elif report_type == 'replacement':
+                reqs = await db.material_requests.find({'request_type': 'REPLACEMENT'}, {'_id': 0}).sort('created_at', -1).to_list(None)
+                for r in reqs:
+                    if sp.get('vendor_id') and r.get('vendor_id') != sp['vendor_id']: continue
+                    report_data.append({
+                        'request_number': r.get('request_number', ''), 'vendor_name': r.get('vendor_name', ''),
+                        'po_number': r.get('po_number', ''), 'total_qty': r.get('total_requested_qty', 0),
+                        'reason': r.get('reason', ''), 'status': r.get('status', ''),
+                        'child_shipment': r.get('child_shipment_number', '-'),
+                        'date': _fmt_date(r.get('created_at')),
+                    })
+                headers = ['No', 'Request No', 'Vendor', 'PO', 'Qty', 'Reason', 'Status', 'Child Shipment', 'Date']
+                all_col_keys = ['no', 'request_number', 'vendor_name', 'po_number', 'total_qty', 'reason', 'status', 'child_shipment', 'date']
+
+            elif report_type == 'accessory':
+                acc_ships = await db.accessory_shipments.find({}, {'_id': 0}).sort('created_at', -1).to_list(None)
+                for s in acc_ships:
+                    if sp.get('vendor_id') and s.get('vendor_id') != sp['vendor_id']: continue
+                    items = await db.accessory_shipment_items.find({'shipment_id': s['id']}).to_list(None)
+                    for item in items:
+                        report_data.append({
+                            'shipment_number': s.get('shipment_number', ''), 'vendor_name': s.get('vendor_name', ''),
+                            'po_number': s.get('po_number', ''), 'date': _fmt_date(s.get('shipment_date')),
+                            'accessory_name': item.get('accessory_name', ''), 'accessory_code': item.get('accessory_code', ''),
+                            'qty_sent': item.get('qty_sent', 0), 'unit': item.get('unit', 'pcs'),
+                            'status': s.get('status', ''),
+                        })
+                headers = ['No', 'Shipment', 'Vendor', 'PO', 'Date', 'Accessory', 'Code', 'Qty', 'Unit', 'Status']
+                all_col_keys = ['no', 'shipment_number', 'vendor_name', 'po_number', 'date', 'accessory_name', 'accessory_code', 'qty_sent', 'unit', 'status']
+            else:
+                return JSONResponse({'error': f'Unhandled report type: {report_type}'}, status_code=400)
+
+            # Build the report PDF
+            report_labels = {
+                'production': 'Laporan Produksi', 'progress': 'Laporan Progres Produksi',
+                'financial': 'Laporan Keuangan', 'shipment': 'Laporan Pengiriman',
+                'defect': 'Laporan Defect Material', 'return': 'Laporan Retur Produksi',
+                'missing-material': 'Laporan Material Hilang/Tambahan', 'replacement': 'Laporan Material Pengganti',
+                'accessory': 'Laporan Aksesoris',
+            }
+            elements = []
+            title = report_labels.get(report_type, f'Report: {report_type}')
+            filter_info = []
+            if sp.get('vendor_id'):
+                vendor = await db.garments.find_one({'id': sp['vendor_id']})
+                filter_info.append(('Vendor', (vendor or {}).get('garment_name', sp['vendor_id'])))
+            if sp.get('date_from'): filter_info.append(('From', sp['date_from']))
+            if sp.get('date_to'): filter_info.append(('To', sp['date_to']))
+            if sp.get('status'): filter_info.append(('Status', sp['status']))
+            _pdf_header(elements, company_name, title, info_pairs=filter_info if filter_info else None)
+
+            if not report_data:
+                elements.append(Paragraph("Tidak ada data ditemukan untuk filter yang dipilih.", styles['Normal']))
+            else:
+                # Build table data
+                data_rows = []
+                for idx, row in enumerate(report_data, 1):
+                    row_values = [idx]
+                    for key in all_col_keys[1:]:  # skip 'no'
+                        val = row.get(key, '')
+                        if key in ('harga', 'hpp', 'amount', 'paid', 'remaining'):
+                            val = _fmt_money(val)
+                        elif key in ('output_qty', 'qty_progress', 'defect_qty', 'total_qty', 'item_count', 'items', 'qty_sent'):
+                            val = val if val else 0
+                        else:
+                            val = _safe_str(val, 25)
+                        row_values.append(val)
+                    data_rows.append(row_values)
+                if config and config.get('columns'):
+                    headers, data_rows = _filter_columns(headers, all_col_keys, config['columns'], data_rows)
+                td = [headers] + data_rows
+                num_cols = len(headers)
+                use_landscape = num_cols > 7
+                page_width = 680 if use_landscape else 445
+                cw = [max(22, int(page_width / num_cols))] * num_cols
+                t = Table(td, colWidths=cw, repeatRows=1)
+                t.setStyle(_pdf_table_style())
+                t.setStyle(TableStyle([('FONTSIZE', (0, 0), (-1, -1), 7 if num_cols > 8 else 8)]))
+                elements.append(t)
+
+            elements.append(Spacer(1, 4*mm))
+            elements.append(Paragraph(f"<i>Total Records: {len(report_data)}</i>", styles['Normal']))
+            _pdf_footer(elements)
+            _build_pdf(buf, elements, page='landscape' if len(headers) > 7 else None)
+            return StreamingResponse(buf, media_type="application/pdf",
+                                     headers={"Content-Disposition": f"attachment; filename=laporan_{report_type}_{datetime.now().strftime('%Y%m%d')}.pdf"})
+
+        else:
+            all_types = [
+                'production-po', 'vendor-shipment', 'buyer-shipment', 'buyer-shipment-dispatch',
+                'production-return', 'material-request', 'production-report',
+                'report-production', 'report-progress', 'report-financial', 'report-shipment',
+                'report-defect', 'report-return', 'report-missing-material', 'report-replacement', 'report-accessory'
+            ]
+            return JSONResponse({'error': f'Unknown PDF type: {pdf_type}', 'available_types': all_types}, status_code=400)
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"PDF export error: {e}", exc_info=True)
+        raise HTTPException(500, f"PDF export failed: {str(e)}")
+
+# ─── PDF EXPORT CONFIGURATION CRUD ───────────────────────────────────────────
+
+# Available columns per PDF type (used by config UI)
+PDF_COLUMN_DEFINITIONS = {
+    'production-po': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'serial', 'label': 'Serial No'},
+        {'key': 'product', 'label': 'Product Name'},
+        {'key': 'sku', 'label': 'SKU'},
+        {'key': 'size', 'label': 'Size'},
+        {'key': 'color', 'label': 'Color'},
+        {'key': 'qty', 'label': 'Quantity', 'required': True},
+        {'key': 'price', 'label': 'Selling Price'},
+        {'key': 'cmt', 'label': 'CMT Price'},
+    ],
+    'vendor-shipment': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'po', 'label': 'PO Number'},
+        {'key': 'serial', 'label': 'Serial No'},
+        {'key': 'product', 'label': 'Product Name'},
+        {'key': 'sku', 'label': 'SKU'},
+        {'key': 'size', 'label': 'Size'},
+        {'key': 'color', 'label': 'Color'},
+        {'key': 'qty_sent', 'label': 'Qty Sent', 'required': True},
+    ],
+    'buyer-shipment-dispatch': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'serial', 'label': 'Serial No'},
+        {'key': 'product', 'label': 'Product Name'},
+        {'key': 'sku', 'label': 'SKU'},
+        {'key': 'size', 'label': 'Size'},
+        {'key': 'color', 'label': 'Color'},
+        {'key': 'ordered', 'label': 'Ordered Qty'},
+        {'key': 'this_dispatch', 'label': 'This Dispatch'},
+        {'key': 'cumul_shipped', 'label': 'Cumulative Shipped'},
+        {'key': 'remaining', 'label': 'Remaining'},
+    ],
+    'production-report': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'date', 'label': 'Date'},
+        {'key': 'po', 'label': 'PO Number'},
+        {'key': 'serial', 'label': 'Serial No'},
+        {'key': 'product', 'label': 'Product Name'},
+        {'key': 'sku', 'label': 'SKU'},
+        {'key': 'size', 'label': 'Size'},
+        {'key': 'color', 'label': 'Color'},
+        {'key': 'qty', 'label': 'Quantity'},
+        {'key': 'price', 'label': 'Price'},
+        {'key': 'cmt', 'label': 'CMT'},
+        {'key': 'vendor', 'label': 'Vendor'},
+        {'key': 'produced', 'label': 'Produced'},
+        {'key': 'shipped', 'label': 'Shipped'},
+    ],
+    'report-production': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'tanggal', 'label': 'Tanggal'},
+        {'key': 'no_po', 'label': 'No PO'},
+        {'key': 'no_seri', 'label': 'Serial'},
+        {'key': 'nama_produk', 'label': 'Produk'},
+        {'key': 'sku', 'label': 'SKU'},
+        {'key': 'size', 'label': 'Size'},
+        {'key': 'warna', 'label': 'Warna'},
+        {'key': 'output_qty', 'label': 'Qty'},
+        {'key': 'harga', 'label': 'Harga'},
+        {'key': 'hpp', 'label': 'HPP/CMT'},
+        {'key': 'garment', 'label': 'Vendor'},
+        {'key': 'po_status', 'label': 'Status'},
+    ],
+    'report-progress': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'date', 'label': 'Tanggal'},
+        {'key': 'job_number', 'label': 'Job'},
+        {'key': 'po_number', 'label': 'PO'},
+        {'key': 'vendor_name', 'label': 'Vendor'},
+        {'key': 'serial_number', 'label': 'Serial'},
+        {'key': 'sku', 'label': 'SKU'},
+        {'key': 'product_name', 'label': 'Produk'},
+        {'key': 'qty_progress', 'label': 'Qty'},
+        {'key': 'notes', 'label': 'Catatan'},
+        {'key': 'recorded_by', 'label': 'Dicatat oleh'},
+    ],
+    'report-financial': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'invoice_number', 'label': 'Invoice No'},
+        {'key': 'category', 'label': 'Category'},
+        {'key': 'po_number', 'label': 'PO'},
+        {'key': 'vendor_or_buyer', 'label': 'Vendor/Buyer'},
+        {'key': 'amount', 'label': 'Amount'},
+        {'key': 'paid', 'label': 'Paid'},
+        {'key': 'remaining', 'label': 'Remaining'},
+        {'key': 'status', 'label': 'Status'},
+        {'key': 'date', 'label': 'Date'},
+    ],
+    'report-shipment': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'direction', 'label': 'Direction'},
+        {'key': 'shipment_number', 'label': 'Shipment No'},
+        {'key': 'shipment_type', 'label': 'Type'},
+        {'key': 'vendor_name', 'label': 'Vendor'},
+        {'key': 'status', 'label': 'Status'},
+        {'key': 'inspection', 'label': 'Inspection'},
+        {'key': 'date', 'label': 'Date'},
+        {'key': 'total_qty', 'label': 'Qty'},
+        {'key': 'items', 'label': 'Items'},
+    ],
+    'report-defect': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'date', 'label': 'Tanggal'},
+        {'key': 'sku', 'label': 'SKU'},
+        {'key': 'product_name', 'label': 'Produk'},
+        {'key': 'size', 'label': 'Size'},
+        {'key': 'color', 'label': 'Warna'},
+        {'key': 'defect_qty', 'label': 'Qty Defect'},
+        {'key': 'defect_type', 'label': 'Tipe'},
+        {'key': 'description', 'label': 'Deskripsi'},
+        {'key': 'status', 'label': 'Status'},
+    ],
+    'report-return': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'return_number', 'label': 'Return No'},
+        {'key': 'po_number', 'label': 'PO'},
+        {'key': 'customer_name', 'label': 'Customer'},
+        {'key': 'return_date', 'label': 'Date'},
+        {'key': 'total_qty', 'label': 'Total Qty'},
+        {'key': 'item_count', 'label': 'Items'},
+        {'key': 'reason', 'label': 'Reason'},
+        {'key': 'status', 'label': 'Status'},
+    ],
+    'report-missing-material': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'request_number', 'label': 'Request No'},
+        {'key': 'vendor_name', 'label': 'Vendor'},
+        {'key': 'po_number', 'label': 'PO'},
+        {'key': 'total_qty', 'label': 'Qty'},
+        {'key': 'reason', 'label': 'Reason'},
+        {'key': 'status', 'label': 'Status'},
+        {'key': 'child_shipment', 'label': 'Child Shipment'},
+        {'key': 'date', 'label': 'Date'},
+    ],
+    'report-replacement': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'request_number', 'label': 'Request No'},
+        {'key': 'vendor_name', 'label': 'Vendor'},
+        {'key': 'po_number', 'label': 'PO'},
+        {'key': 'total_qty', 'label': 'Qty'},
+        {'key': 'reason', 'label': 'Reason'},
+        {'key': 'status', 'label': 'Status'},
+        {'key': 'child_shipment', 'label': 'Child Shipment'},
+        {'key': 'date', 'label': 'Date'},
+    ],
+    'report-accessory': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'shipment_number', 'label': 'Shipment'},
+        {'key': 'vendor_name', 'label': 'Vendor'},
+        {'key': 'po_number', 'label': 'PO'},
+        {'key': 'date', 'label': 'Date'},
+        {'key': 'accessory_name', 'label': 'Accessory'},
+        {'key': 'accessory_code', 'label': 'Code'},
+        {'key': 'qty_sent', 'label': 'Qty'},
+        {'key': 'unit', 'label': 'Unit'},
+        {'key': 'status', 'label': 'Status'},
+    ],
+}
+
+@api.get("/pdf-export-columns")
+async def get_pdf_export_columns(request: Request):
+    """Get available columns for a PDF type."""
+    require_auth(request)
+    pdf_type = request.query_params.get('type', '')
+    if pdf_type in PDF_COLUMN_DEFINITIONS:
+        return {'pdf_type': pdf_type, 'columns': PDF_COLUMN_DEFINITIONS[pdf_type]}
+    return {'pdf_type': pdf_type, 'columns': [], 'available_types': list(PDF_COLUMN_DEFINITIONS.keys())}
+
+@api.get("/pdf-export-configs")
+async def list_pdf_export_configs(request: Request):
+    """List all PDF export configurations."""
+    require_auth(request)
+    db = get_db()
+    pdf_type = request.query_params.get('type')
+    query = {}
+    if pdf_type: query['pdf_type'] = pdf_type
+    configs = await db.pdf_export_configs.find(query, {'_id': 0}).sort('created_at', -1).to_list(None)
+    return serialize_doc(configs)
+
+@api.get("/pdf-export-configs/{config_id}")
+async def get_pdf_export_config(config_id: str, request: Request):
+    require_auth(request)
+    db = get_db()
+    cfg = await db.pdf_export_configs.find_one({'id': config_id}, {'_id': 0})
+    if not cfg: raise HTTPException(404, 'Config not found')
+    return serialize_doc(cfg)
+
+@api.post("/pdf-export-configs")
+async def create_pdf_export_config(request: Request):
+    """Create a new PDF export config."""
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    pdf_type = body.get('pdf_type', '')
+    name = body.get('name', '')
+    columns = body.get('columns', [])
+    is_default = body.get('is_default', False)
+    if not pdf_type or not name: raise HTTPException(400, 'pdf_type and name required')
+    if not columns: raise HTTPException(400, 'columns array required')
+    # Ensure required columns are included
+    if pdf_type in PDF_COLUMN_DEFINITIONS:
+        required = [c['key'] for c in PDF_COLUMN_DEFINITIONS[pdf_type] if c.get('required')]
+        for rk in required:
+            if rk not in columns:
+                columns.insert(0, rk)
+    # If setting as default, unset other defaults for this type
+    if is_default:
+        await db.pdf_export_configs.update_many({'pdf_type': pdf_type, 'is_default': True}, {'$set': {'is_default': False}})
+    doc = {
+        'id': str(uuid.uuid4()),
+        'pdf_type': pdf_type,
+        'name': name,
+        'columns': columns,
+        'is_default': is_default,
+        'created_by': user.get('name', ''),
+        'created_at': datetime.now(timezone.utc),
+        'updated_at': datetime.now(timezone.utc),
+    }
+    await db.pdf_export_configs.insert_one(doc)
+    await log_activity(user['id'], user.get('name', ''), 'create', 'pdf_config', f"Created PDF config: {name} for {pdf_type}")
+    return JSONResponse(serialize_doc({k: v for k, v in doc.items() if k != '_id'}), status_code=201)
+
+@api.put("/pdf-export-configs/{config_id}")
+async def update_pdf_export_config(config_id: str, request: Request):
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    existing = await db.pdf_export_configs.find_one({'id': config_id})
+    if not existing: raise HTTPException(404, 'Config not found')
+    update = {'updated_at': datetime.now(timezone.utc)}
+    if 'name' in body: update['name'] = body['name']
+    if 'columns' in body:
+        columns = body['columns']
+        pdf_type = existing.get('pdf_type', '')
+        if pdf_type in PDF_COLUMN_DEFINITIONS:
+            required = [c['key'] for c in PDF_COLUMN_DEFINITIONS[pdf_type] if c.get('required')]
+            for rk in required:
+                if rk not in columns:
+                    columns.insert(0, rk)
+        update['columns'] = columns
+    if 'is_default' in body:
+        if body['is_default']:
+            await db.pdf_export_configs.update_many({'pdf_type': existing['pdf_type'], 'is_default': True}, {'$set': {'is_default': False}})
+        update['is_default'] = body['is_default']
+    await db.pdf_export_configs.update_one({'id': config_id}, {'$set': update})
+    updated = await db.pdf_export_configs.find_one({'id': config_id}, {'_id': 0})
+    return serialize_doc(updated)
+
+@api.delete("/pdf-export-configs/{config_id}")
+async def delete_pdf_export_config(config_id: str, request: Request):
+    user = require_auth(request)
+    db = get_db()
+    existing = await db.pdf_export_configs.find_one({'id': config_id})
+    if not existing: raise HTTPException(404, 'Config not found')
+    await db.pdf_export_configs.delete_one({'id': config_id})
+    await log_activity(user['id'], user.get('name', ''), 'delete', 'pdf_config', f"Deleted PDF config: {existing.get('name', config_id)}")
+    return {'success': True}
+
+# ─── UPLOAD (handled by routes/file_storage.py) ─────────────────────────────
+
+# ─── PO STATUS TRANSITION ───────────────────────────────────────────────────
+@api.post("/production-pos/{po_id}/status")
+async def transition_po_status(po_id: str, request: Request):
+    """Transition PO through staged statuses."""
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    new_status = body.get('status')
+    if new_status not in PO_STATUSES:
+        raise HTTPException(400, f"Invalid status. Valid: {PO_STATUSES}")
+    po = await db.production_pos.find_one({'id': po_id})
+    if not po: raise HTTPException(404, 'PO not found')
+    update_data = {'status': new_status, 'updated_at': now()}
+    if body.get('notes'): update_data['status_notes'] = body['notes']
+    if new_status == 'Closed':
+        update_data['closed_by'] = user['name']
+        update_data['closed_at'] = now()
+        update_data['close_reason'] = body.get('close_reason', '')
+    await db.production_pos.update_one({'id': po_id}, {'$set': update_data})
+    await log_activity(user['id'], user['name'], 'Status Change', 'Production PO',
+                       f"PO {po.get('po_number')}: {po.get('status')} → {new_status}")
+    return serialize_doc(await db.production_pos.find_one({'id': po_id}, {'_id': 0}))
+
+# ─── PO QUANTITY SUMMARY ────────────────────────────────────────────────────
+@api.get("/production-pos/{po_id}/quantity-summary")
+async def po_quantity_summary(po_id: str, request: Request):
+    """Get comprehensive quantity summary for a PO."""
+    require_auth(request)
+    db = get_db()
+    po = await db.production_pos.find_one({'id': po_id}, {'_id': 0})
+    if not po: raise HTTPException(404, 'PO not found')
+    items = await db.po_items.find({'po_id': po_id}, {'_id': 0}).to_list(None)
+    summary_items = []
+    totals = {'ordered': 0, 'received': 0, 'missing': 0, 'defect': 0, 
+              'available': 0, 'produced': 0, 'shipped': 0, 'returned': 0}
+    for item in items:
+        # Get all shipment items for this po_item
+        ship_items = await db.vendor_shipment_items.find({'po_item_id': item['id']}).to_list(None)
+        # Get inspection data
+        received = 0; missing = 0
+        for si in ship_items:
+            ship = await db.vendor_shipments.find_one({'id': si.get('shipment_id')})
+            if ship and ship.get('inspection_status') == 'Inspected':
+                insp = await db.vendor_material_inspections.find_one({'shipment_id': si['shipment_id']})
+                if insp:
+                    ii = await db.vendor_material_inspection_items.find_one({
+                        'inspection_id': insp['id'], 'shipment_item_id': si['id']})
+                    if ii:
+                        received += ii.get('received_qty', 0)
+                        missing += ii.get('missing_qty', 0)
+                    else:
+                        received += si.get('qty_sent', 0)
+            elif ship and ship.get('status') == 'Received':
+                received += si.get('qty_sent', 0)
+        # Defects
+        defects = await db.material_defect_reports.find({'po_item_id': item['id']}).to_list(None)
+        total_defect = sum(d.get('defect_qty', 0) for d in defects)
+        available = max(0, received - total_defect)
+        # Production
+        job_items = await db.production_job_items.find({'po_item_id': item['id']}).to_list(None)
+        produced = sum(ji.get('produced_qty', 0) for ji in job_items)
+        # Shipped
+        buyer_items = await db.buyer_shipment_items.find({'po_item_id': item['id']}).to_list(None)
+        shipped = sum(bi.get('qty_shipped', 0) for bi in buyer_items)
+        # Returns
+        return_items = await db.production_return_items.find({'po_item_id': item['id']}).to_list(None)
+        returned = sum(ri.get('return_qty', 0) for ri in return_items)
+        ordered = item.get('qty', 0)
+        over = max(0, produced - ordered)
+        under = max(0, ordered - produced)
+        summary_items.append({
+            **serialize_doc(item),
+            'ordered_qty': ordered, 'received_qty': received, 'missing_qty': missing,
+            'defect_qty': total_defect, 'available_qty': available, 'produced_qty': produced,
+            'shipped_qty': shipped, 'returned_qty': returned,
+            'overproduction_qty': over, 'underproduction_qty': under
+        })
+        totals['ordered'] += ordered; totals['received'] += received
+        totals['missing'] += missing; totals['defect'] += total_defect
+        totals['available'] += available; totals['produced'] += produced
+        totals['shipped'] += shipped; totals['returned'] += returned
+    totals['overproduction'] = max(0, totals['produced'] - totals['ordered'])
+    totals['underproduction'] = max(0, totals['ordered'] - totals['produced'])
+    return {'po': serialize_doc(po), 'items': summary_items, 'totals': totals}
+
+# ─── SERIAL TRACKING TIMELINE ───────────────────────────────────────────────
+@api.get("/serial-trace")
+async def serial_trace(request: Request):
+    """Get full lifecycle timeline + PO-wide summary for a serial number."""
+    require_auth(request)
+    db = get_db()
+    serial = request.query_params.get('serial', '').strip()
+    if not serial: raise HTTPException(400, 'serial parameter required')
+    timeline = []
+    # 1. PO items with this serial
+    po_items = await db.po_items.find({'serial_number': serial}, {'_id': 0}).to_list(None)
+    po_ids = list(set(pi.get('po_id') for pi in po_items if pi.get('po_id')))
+    po_item_ids = [pi['id'] for pi in po_items]
+    # 2. Get ALL items from the same POs (all serials in the PO)
+    all_po_items = []
+    po_details = {}
+    for pid in po_ids:
+        po = await db.production_pos.find_one({'id': pid}, {'_id': 0})
+        if po: po_details[pid] = po
+        items = await db.po_items.find({'po_id': pid}, {'_id': 0}).to_list(None)
+        all_po_items.extend(items)
+    all_po_item_ids = [pi['id'] for pi in all_po_items]
+    # 3. Build summary for ALL items in the PO (not just searched serial)
+    summary_items = []
+    totals = {'ordered': 0, 'produced': 0, 'shipped': 0, 'not_produced': 0, 'not_shipped': 0}
+    vendors_set = set()
+    buyer_names = set()
+    for item in all_po_items:
+        po = po_details.get(item.get('po_id'), {})
+        vendors_set.add(po.get('vendor_name', ''))
+        buyer_names.add(po.get('customer_name', ''))
+        ji_list = await db.production_job_items.find({'po_item_id': item['id']}).to_list(None)
+        produced = sum(j.get('produced_qty', 0) for j in ji_list)
+        bi_list = await db.buyer_shipment_items.find({'po_item_id': item['id']}).to_list(None)
+        shipped = sum(b.get('qty_shipped', 0) for b in bi_list)
+        ordered = item.get('qty', 0)
+        summary_items.append({
+            'po_item_id': item['id'], 'serial_number': item.get('serial_number', ''),
+            'product_name': item.get('product_name', ''), 'sku': item.get('sku', ''),
+            'size': item.get('size', ''), 'color': item.get('color', ''),
+            'ordered_qty': ordered, 'produced_qty': produced, 'shipped_qty': shipped,
+            'not_produced': max(0, ordered - produced), 'not_shipped': max(0, ordered - shipped),
+            'is_searched_serial': item.get('serial_number') == serial,
+            'po_number': item.get('po_number', po.get('po_number', ''))
+        })
+        totals['ordered'] += ordered; totals['produced'] += produced; totals['shipped'] += shipped
+    totals['not_produced'] = max(0, totals['ordered'] - totals['produced'])
+    totals['not_shipped'] = max(0, totals['ordered'] - totals['shipped'])
+    # 4. Build timeline events for the SEARCHED serial only
+    for pi in po_items:
+        po = po_details.get(pi.get('po_id'), {})
+        timeline.append({
+            'step': 'PO Created', 'event': 'PO Dibuat', 'details': f"PO {po.get('po_number','')} - {pi.get('product_name','')} ({pi.get('sku','')}) x{pi.get('qty',0)}",
+            'date': serialize_doc(pi.get('created_at')),
+            'module': 'production-po', 'po_number': pi.get('po_number'),
+            'po_item_id': pi['id'], 'qty': pi.get('qty', 0),
+            'sku': pi.get('sku'), 'size': pi.get('size'), 'color': pi.get('color'),
+            'customer_name': po.get('customer_name', ''),
+            'vendor_name': po.get('vendor_name', ''), 'status': po.get('status', '')
+        })
+    for poi_id in po_item_ids:
+        ship_items = await db.vendor_shipment_items.find({'po_item_id': poi_id}, {'_id': 0}).to_list(None)
+        for si in ship_items:
+            ship = await db.vendor_shipments.find_one({'id': si.get('shipment_id')}, {'_id': 0})
+            ship_type = (ship or {}).get('shipment_type', 'NORMAL')
+            ship_num = (ship or {}).get('shipment_number', '')
+            timeline.append({
+                'step': f"Vendor Shipment ({ship_type})",
+                'event': f"Pengiriman Vendor ({ship_type})",
+                'details': f"Shipment {ship_num} - dikirim {si.get('qty_sent', 0)} pcs",
+                'date': serialize_doc((ship or {}).get('shipment_date', si.get('created_at'))),
+                'module': 'vendor-shipments', 'shipment_number': ship_num,
+                'qty_sent': si.get('qty_sent', 0), 'status': (ship or {}).get('status', ''),
+                'inspection_status': (ship or {}).get('inspection_status', 'Pending')
+            })
+    for poi_id in po_item_ids:
+        sis = await db.vendor_shipment_items.find({'po_item_id': poi_id}).to_list(None)
+        for si in sis:
+            insp = await db.vendor_material_inspections.find_one({'shipment_id': si.get('shipment_id')})
+            if insp:
+                ii = await db.vendor_material_inspection_items.find_one({'inspection_id': insp['id'], 'shipment_item_id': si['id']})
+                if ii:
+                    timeline.append({'step': 'Material Inspection',
+                        'event': 'Inspeksi Material',
+                        'details': f"Diterima: {ii.get('received_qty', 0)}, Missing: {ii.get('missing_qty', 0)}, Defect: {ii.get('defect_qty', 0)}",
+                        'date': serialize_doc(insp.get('inspection_date')),
+                        'module': 'inspections', 'received_qty': ii.get('received_qty', 0),
+                        'missing_qty': ii.get('missing_qty', 0), 'condition_notes': ii.get('condition_notes', '')})
+    for poi_id in po_item_ids:
+        ji_list = await db.production_job_items.find({'po_item_id': poi_id}, {'_id': 0}).to_list(None)
+        for ji in ji_list:
+            job = await db.production_jobs.find_one({'id': ji.get('job_id')}, {'_id': 0})
+            timeline.append({'step': 'Production Job',
+                'event': 'Job Produksi Dibuat',
+                'details': f"Job {(job or {}).get('job_number', '')} - tersedia {ji.get('available_qty', 0)} pcs, diproduksi {ji.get('produced_qty', 0)} pcs",
+                'date': serialize_doc(ji.get('created_at')),
+                'module': 'production-jobs', 'job_number': (job or {}).get('job_number', ''),
+                'available_qty': ji.get('available_qty', 0), 'produced_qty': ji.get('produced_qty', 0),
+                'status': (job or {}).get('status', '')})
+    for poi_id in po_item_ids:
+        ji_list = await db.production_job_items.find({'po_item_id': poi_id}).to_list(None)
+        for ji in ji_list:
+            progs = await db.production_progress.find({'job_item_id': ji['id']}, {'_id': 0}).sort('progress_date', 1).to_list(None)
+            for p in progs:
+                timeline.append({'step': 'Production Progress',
+                    'event': 'Progres Produksi',
+                    'details': f"Selesai {p.get('completed_quantity', 0)} pcs - {p.get('notes', '')}",
+                    'date': serialize_doc(p.get('progress_date')),
+                    'module': 'production-progress', 'completed_quantity': p.get('completed_quantity', 0),
+                    'notes': p.get('notes', ''), 'recorded_by': p.get('recorded_by', '')})
+    for poi_id in po_item_ids:
+        bis = await db.buyer_shipment_items.find({'po_item_id': poi_id}, {'_id': 0}).sort('dispatch_seq', 1).to_list(None)
+        for bi in bis:
+            bs = await db.buyer_shipments.find_one({'id': bi.get('shipment_id')}, {'_id': 0})
+            timeline.append({'step': f"Buyer Dispatch #{bi.get('dispatch_seq', 1)}",
+                'event': f"Pengiriman ke Buyer #{bi.get('dispatch_seq', 1)}",
+                'details': f"Shipment {(bs or {}).get('shipment_number', '')} - dikirim {bi.get('qty_shipped', 0)} pcs",
+                'date': serialize_doc(bi.get('dispatch_date', bi.get('created_at'))),
+                'module': 'buyer-shipments', 'shipment_number': (bs or {}).get('shipment_number', ''),
+                'qty_shipped': bi.get('qty_shipped', 0), 'ordered_qty': bi.get('ordered_qty', 0)})
+    for poi_id in po_item_ids:
+        ris = await db.production_return_items.find({'po_item_id': poi_id}, {'_id': 0}).to_list(None)
+        for ri in ris:
+            ret = await db.production_returns.find_one({'id': ri.get('return_id')}, {'_id': 0})
+            timeline.append({'step': 'Production Return',
+                'event': 'Retur Produksi',
+                'details': f"Return {(ret or {}).get('return_number', '')} - {ri.get('return_qty', 0)} pcs",
+                'date': serialize_doc((ret or {}).get('return_date')),
+                'module': 'production-returns', 'return_number': (ret or {}).get('return_number', ''),
+                'return_qty': ri.get('return_qty', 0), 'status': (ret or {}).get('status', '')})
+    timeline.sort(key=lambda x: x.get('date', '') or '')
+    # Build PO info
+    po_info = []
+    for pid in po_ids:
+        po = po_details.get(pid, {})
+        po_info.append({'po_id': pid, 'po_number': po.get('po_number', ''),
+            'customer_name': po.get('customer_name', ''), 'vendor_name': po.get('vendor_name', ''),
+            'status': po.get('status', ''), 'deadline': serialize_doc(po.get('deadline'))})
+    return {
+        'serial_number': serial, 'po_item_count': len(po_items),
+        'po_count': len(po_ids), 'po_info': po_info,
+        'summary': {
+            'buyer': ', '.join(filter(None, buyer_names)),
+            'vendors': ', '.join(filter(None, vendors_set)),
+            'total_ordered': totals['ordered'], 'total_produced': totals['produced'],
+            'total_not_produced': totals['not_produced'], 'total_shipped': totals['shipped'],
+            'total_not_shipped': totals['not_shipped'],
+            'all_serials': list(set(i.get('serial_number', '') for i in all_po_items if i.get('serial_number'))),
+        },
+        'all_items': summary_items, 'timeline': timeline
+    }
+
+# ─── ACCESSORY MANAGEMENT ───────────────────────────────────────────────────
+@api.get("/accessories")
+async def get_accessories(request: Request):
+    require_auth(request)
+    db = get_db()
+    sp = request.query_params
+    query = {}
+    if sp.get('search'):
+        query['$or'] = [{'name': {'$regex': sp['search'], '$options': 'i'}},
+                        {'code': {'$regex': sp['search'], '$options': 'i'}}]
+    if sp.get('status'): query['status'] = sp['status']
+    return serialize_doc(await db.accessories.find(query, {'_id': 0}).sort('created_at', -1).to_list(None))
+
+@api.post("/accessories")
+async def create_accessory(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    acc = {'id': new_id(), **body, 'status': body.get('status', 'active'),
+           'created_at': now(), 'updated_at': now()}
+    await db.accessories.insert_one(acc)
+    await log_activity(user['id'], user['name'], 'Create', 'Accessories', f"Created accessory: {body.get('name')}")
+    return JSONResponse(serialize_doc(acc), status_code=201)
+
+@api.put("/accessories/{acc_id}")
+async def update_accessory(acc_id: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    body.pop('_id', None); body.pop('id', None)
+    await db.accessories.update_one({'id': acc_id}, {'$set': {**body, 'updated_at': now()}})
+    return serialize_doc(await db.accessories.find_one({'id': acc_id}, {'_id': 0}))
+
+@api.delete("/accessories/{acc_id}")
+async def delete_accessory(acc_id: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    await db.accessories.delete_one({'id': acc_id})
+    return {'success': True}
+
+# ─── ACCESSORY SHIPMENTS ────────────────────────────────────────────────────
+@api.get("/accessory-shipments")
+async def get_accessory_shipments(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    query = {}
+    sp = request.query_params
+    if sp.get('po_id'): query['po_id'] = sp['po_id']
+    if sp.get('vendor_id'): query['vendor_id'] = sp['vendor_id']
+    if user.get('role') == 'vendor': query['vendor_id'] = user.get('vendor_id')
+    shipments = await db.accessory_shipments.find(query, {'_id': 0}).sort('created_at', -1).to_list(None)
+    result = []
+    for s in shipments:
+        items = await db.accessory_shipment_items.find({'shipment_id': s['id']}, {'_id': 0}).to_list(None)
+        result.append({**serialize_doc(s), 'items': serialize_doc(items)})
+    return result
+
+@api.post("/accessory-shipments")
+async def create_accessory_shipment(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    vendor = await db.garments.find_one({'id': body.get('vendor_id')})
+    if not vendor: raise HTTPException(404, 'Vendor not found')
+    ship_id = new_id()
+    shipment = {
+        'id': ship_id, 'shipment_number': body.get('shipment_number'),
+        'vendor_id': body['vendor_id'], 'vendor_name': vendor.get('garment_name', ''),
+        'po_id': body.get('po_id'), 'po_number': body.get('po_number', ''),
+        'shipment_date': parse_date(body.get('shipment_date')) or now(),
+        'status': 'Sent', 'notes': body.get('notes', ''),
+        'created_by': user['name'], 'created_at': now(), 'updated_at': now()
+    }
+    await db.accessory_shipments.insert_one(shipment)
+    inserted_items = []
+    for item in body.get('items', []):
+        si = {
+            'id': new_id(), 'shipment_id': ship_id,
+            'accessory_id': item.get('accessory_id'),
+            'accessory_name': item.get('accessory_name', ''),
+            'accessory_code': item.get('accessory_code', ''),
+            'qty_sent': int(item.get('qty_sent', 0) or 0),
+            'unit': item.get('unit', 'pcs'),
+            'notes': item.get('notes', ''), 'created_at': now()
+        }
+        await db.accessory_shipment_items.insert_one(si)
+        inserted_items.append(si)
+    await log_activity(user['id'], user['name'], 'Create', 'Accessory Shipment',
+                       f"Created accessory shipment {body.get('shipment_number')}")
+    result = serialize_doc(shipment)
+    result['items'] = serialize_doc(inserted_items)
+    return JSONResponse(result, status_code=201)
+
+@api.put("/accessory-shipments/{sid}")
+async def update_accessory_shipment(sid: str, request: Request):
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    body.pop('_id', None); body.pop('id', None); body.pop('items', None)
+    await db.accessory_shipments.update_one({'id': sid}, {'$set': {**body, 'updated_at': now()}})
+    return serialize_doc(await db.accessory_shipments.find_one({'id': sid}, {'_id': 0}))
+
+@api.delete("/accessory-shipments/{sid}")
+async def delete_accessory_shipment(sid: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    await db.accessory_shipment_items.delete_many({'shipment_id': sid})
+    await db.accessory_shipments.delete_one({'id': sid})
+    return {'success': True}
+
+# ─── ACCESSORY INSPECTIONS ───────────────────────────────────────────────────
+@api.get("/accessory-inspections")
+async def get_acc_inspections(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    query = {}
+    sp = request.query_params
+    if sp.get('shipment_id'): query['shipment_id'] = sp['shipment_id']
+    if sp.get('vendor_id'): query['vendor_id'] = sp['vendor_id']
+    if user.get('role') == 'vendor': query['vendor_id'] = user.get('vendor_id')
+    return serialize_doc(await db.accessory_inspections.find(query, {'_id': 0}).sort('created_at', -1).to_list(None))
+
+@api.post("/accessory-inspections")
+async def create_acc_inspection(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
+    shipment = await db.accessory_shipments.find_one({'id': body.get('shipment_id')}) if body.get('shipment_id') else None
+    if not shipment: raise HTTPException(404, 'Accessory shipment tidak ditemukan')
+    existing = await db.accessory_inspections.find_one({'shipment_id': body['shipment_id']})
+    if existing: raise HTTPException(400, 'Inspeksi sudah dilakukan untuk shipment ini')
+    insp_id = new_id()
+    items_data = body.get('items', [])
+    total_received = sum(int(i.get('received_qty', 0) or 0) for i in items_data)
+    total_missing = sum(int(i.get('missing_qty', 0) or 0) for i in items_data)
+    inspection = {
+        'id': insp_id, 'shipment_id': body['shipment_id'],
+        'vendor_id': vendor_id, 'vendor_name': shipment.get('vendor_name', ''),
+        'po_id': shipment.get('po_id'), 'po_number': shipment.get('po_number', ''),
+        'inspection_date': parse_date(body.get('inspection_date')) or now(),
+        'total_received': total_received, 'total_missing': total_missing,
+        'notes': body.get('notes', ''), 'status': 'Submitted',
+        'submitted_by': user['name'], 'created_at': now(), 'updated_at': now()
+    }
+    await db.accessory_inspections.insert_one(inspection)
+    for item in items_data:
+        await db.accessory_inspection_items.insert_one({
+            'id': new_id(), 'inspection_id': insp_id,
+            'shipment_item_id': item.get('shipment_item_id'),
+            'accessory_name': item.get('accessory_name', ''), 'accessory_code': item.get('accessory_code', ''),
+            'qty_sent': int(item.get('qty_sent', 0) or 0),
+            'received_qty': int(item.get('received_qty', 0) or 0),
+            'missing_qty': int(item.get('missing_qty', 0) or 0),
+            'condition_notes': item.get('condition_notes', ''), 'created_at': now()
+        })
+    await db.accessory_shipments.update_one({'id': body['shipment_id']}, {'$set': {
+        'inspection_status': 'Inspected', 'total_received': total_received,
+        'total_missing': total_missing, 'updated_at': now()
+    }})
+    await log_activity(user['id'], user['name'], 'Create', 'Accessory Inspection',
+                       f"Inspeksi aksesoris shipment {shipment.get('shipment_number')}")
+    result = serialize_doc(inspection)
+    items_docs = await db.accessory_inspection_items.find({'inspection_id': insp_id}, {'_id': 0}).to_list(None)
+    result['items'] = serialize_doc(items_docs)
+    return JSONResponse(result, status_code=201)
+
+# ─── ACCESSORY DEFECTS ──────────────────────────────────────────────────────
+@api.get("/accessory-defects")
+async def get_acc_defects(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    query = {}
+    if user.get('role') == 'vendor': query['vendor_id'] = user.get('vendor_id')
+    if request.query_params.get('vendor_id'): query['vendor_id'] = request.query_params['vendor_id']
+    return serialize_doc(await db.accessory_defects.find(query, {'_id': 0}).sort('created_at', -1).to_list(None))
+
+@api.post("/accessory-defects")
+async def create_acc_defect(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
+    if not vendor_id: raise HTTPException(400, 'vendor_id diperlukan')
+    defect = {
+        'id': new_id(), 'vendor_id': vendor_id,
+        'po_id': body.get('po_id'), 'shipment_id': body.get('shipment_id'),
+        'accessory_name': body.get('accessory_name', ''), 'accessory_code': body.get('accessory_code', ''),
+        'defect_qty': int(body.get('defect_qty', 0) or 0),
+        'defect_type': body.get('defect_type', 'Material Cacat'),
+        'description': body.get('description', ''),
+        'report_date': parse_date(body.get('report_date')) or now(),
+        'status': 'Reported', 'reported_by': user['name'],
+        'created_at': now(), 'updated_at': now()
+    }
+    await db.accessory_defects.insert_one(defect)
+    await log_activity(user['id'], user['name'], 'Create', 'Accessory Defect',
+                       f"Laporan cacat aksesoris: {body.get('accessory_name')} - {body.get('defect_qty')} pcs")
+    return JSONResponse(serialize_doc(defect), status_code=201)
+
+# ─── ACCESSORY REQUESTS ─────────────────────────────────────────────────────
+@api.get("/accessory-requests")
+async def get_acc_requests(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    query = {}
+    sp = request.query_params
+    if user.get('role') == 'vendor': query['vendor_id'] = user.get('vendor_id')
+    if sp.get('status'): query['status'] = sp['status']
+    if sp.get('request_type'): query['request_type'] = sp['request_type']
+    return serialize_doc(await db.accessory_requests.find(query, {'_id': 0}).sort('created_at', -1).to_list(None))
+
+@api.post("/accessory-requests")
+async def create_acc_request(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    vendor_id = user.get('vendor_id') if user.get('role') == 'vendor' else body.get('vendor_id')
+    if not vendor_id: raise HTTPException(400, 'vendor_id diperlukan')
+    if body.get('request_type') not in ['ADDITIONAL', 'REPLACEMENT']:
+        raise HTTPException(400, 'request_type harus ADDITIONAL atau REPLACEMENT')
+    seq = (await db.accessory_requests.count_documents({})) + 1
+    prefix = 'ACC-ADD' if body['request_type'] == 'ADDITIONAL' else 'ACC-RPL'
+    req_doc = {
+        'id': new_id(), 'request_number': f"{prefix}-{str(seq).zfill(4)}",
+        'request_type': body['request_type'],
+        'vendor_id': vendor_id,
+        'original_shipment_id': body.get('original_shipment_id'),
+        'po_id': body.get('po_id'), 'po_number': body.get('po_number', ''),
+        'items': body.get('items', []),
+        'total_requested_qty': sum(int(i.get('requested_qty', 0) or 0) for i in body.get('items', [])),
+        'reason': body.get('reason', ''), 'status': 'Pending',
+        'created_by': user['name'], 'created_at': now(), 'updated_at': now()
+    }
+    await db.accessory_requests.insert_one(req_doc)
+    await log_activity(user['id'], user['name'], 'Create', 'Accessory Request',
+                       f"Request aksesoris {body['request_type']}: {req_doc['request_number']}")
+    return JSONResponse(serialize_doc(req_doc), status_code=201)
+
+@api.put("/accessory-requests/{req_id}")
+async def update_acc_request(req_id: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    req = await db.accessory_requests.find_one({'id': req_id})
+    if not req: raise HTTPException(404, 'Request tidak ditemukan')
+    new_status = body.get('status')
+    if new_status == 'Approved' and req.get('status') == 'Pending':
+        orig_ship = await db.accessory_shipments.find_one({'id': req.get('original_shipment_id')})
+        if orig_ship:
+            existing_children = await db.accessory_shipments.count_documents({
+                'parent_shipment_id': req['original_shipment_id']})
+            suffix = f"A{existing_children + 1}" if req['request_type'] == 'ADDITIONAL' else f"R{existing_children + 1}"
+            child_number = f"{orig_ship.get('shipment_number', '')}-{suffix}"
+            child_id = new_id()
+            child_ship = {
+                'id': child_id, 'shipment_number': child_number,
+                'vendor_id': orig_ship.get('vendor_id'), 'vendor_name': orig_ship.get('vendor_name', ''),
+                'po_id': orig_ship.get('po_id'), 'po_number': orig_ship.get('po_number', ''),
+                'shipment_date': now(), 'shipment_type': req['request_type'],
+                'parent_shipment_id': req['original_shipment_id'],
+                'status': 'Sent', 'notes': f"Child accessory shipment ({req['request_type']})",
+                'created_by': user['name'], 'created_at': now(), 'updated_at': now()
+            }
+            await db.accessory_shipments.insert_one(child_ship)
+            for ri in req.get('items', []):
+                await db.accessory_shipment_items.insert_one({
+                    'id': new_id(), 'shipment_id': child_id,
+                    'accessory_name': ri.get('accessory_name', ''), 'accessory_code': ri.get('accessory_code', ''),
+                    'qty_sent': int(ri.get('requested_qty', 0) or 0), 'unit': ri.get('unit', 'pcs'),
+                    'created_at': now()
+                })
+            await db.accessory_requests.update_one({'id': req_id}, {'$set': {
+                'status': 'Approved', 'admin_notes': body.get('admin_notes', ''),
+                'approved_by': user['name'], 'approved_at': now(),
+                'child_shipment_id': child_id, 'child_shipment_number': child_number,
+                'updated_at': now()
+            }})
+            result = serialize_doc(await db.accessory_requests.find_one({'id': req_id}, {'_id': 0}))
+            result['child_shipment'] = serialize_doc(child_ship)
+            return result
+    if new_status == 'Rejected':
+        await db.accessory_requests.update_one({'id': req_id}, {'$set': {
+            'status': 'Rejected', 'admin_notes': body.get('admin_notes', ''), 'updated_at': now()
+        }})
+    else:
+        upd = {k: v for k, v in body.items() if k not in ('_id', 'id')}
+        await db.accessory_requests.update_one({'id': req_id}, {'$set': {**upd, 'updated_at': now()}})
+    return serialize_doc(await db.accessory_requests.find_one({'id': req_id}, {'_id': 0}))
 
 
-# Define Models
-class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
-    
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+# ─── REMINDER SYSTEM ─────────────────────────────────────────────────────────
+@api.get("/reminders")
+async def get_reminders(request: Request):
+    user = require_auth(request)
+    db = get_db()
+    query = {}
+    if user.get('role') == 'vendor':
+        query['vendor_id'] = user.get('vendor_id')
+    sp = request.query_params
+    if sp.get('status'): query['status'] = sp['status']
+    if sp.get('vendor_id') and user.get('role') != 'vendor': query['vendor_id'] = sp['vendor_id']
+    reminders = await db.reminders.find(query, {'_id': 0}).sort('created_at', -1).to_list(None)
+    return serialize_doc(reminders)
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+@api.post("/reminders")
+async def create_reminder(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    vendor_id = body.get('vendor_id')
+    if not vendor_id: raise HTTPException(400, 'vendor_id required')
+    vendor = await db.garments.find_one({'id': vendor_id})
+    reminder = {
+        'id': new_id(),
+        'vendor_id': vendor_id, 'vendor_name': (vendor or {}).get('garment_name', ''),
+        'po_id': body.get('po_id', ''), 'po_number': body.get('po_number', ''),
+        'reminder_type': body.get('reminder_type', 'general'),
+        'subject': body.get('subject', ''), 'message': body.get('message', ''),
+        'priority': body.get('priority', 'normal'),
+        'status': 'pending', 'response': None, 'response_date': None,
+        'created_by': user.get('name', ''), 'created_at': now(), 'updated_at': now()
+    }
+    await db.reminders.insert_one(reminder)
+    await log_activity(user['id'], user.get('name', ''), 'create', 'reminder', f"Sent reminder to {(vendor or {}).get('garment_name', vendor_id)}")
+    return JSONResponse(serialize_doc({k: v for k, v in reminder.items() if k != '_id'}), status_code=201)
 
-# Add your routes to the router instead of directly to app
-@api_router.get("/")
-async def root():
-    return {"message": "Hello World"}
+@api.put("/reminders/{reminder_id}")
+async def update_reminder(reminder_id: str, request: Request):
+    user = require_auth(request)
+    db = get_db()
+    body = await request.json()
+    existing = await db.reminders.find_one({'id': reminder_id})
+    if not existing: raise HTTPException(404, 'Reminder not found')
+    update = {'updated_at': now()}
+    # Vendor responding
+    if user.get('role') == 'vendor' and body.get('response'):
+        update['response'] = body['response']
+        update['response_date'] = now()
+        update['responded_by'] = user.get('name', '')
+        update['status'] = 'responded'
+    # Admin updating
+    if user.get('role') in ['admin', 'superadmin']:
+        if 'status' in body: update['status'] = body['status']
+        if 'message' in body: update['message'] = body['message']
+    await db.reminders.update_one({'id': reminder_id}, {'$set': update})
+    return serialize_doc(await db.reminders.find_one({'id': reminder_id}, {'_id': 0}))
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
-    
-    # Convert to dict and serialize datetime to ISO string for MongoDB
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    
-    _ = await db.status_checks.insert_one(doc)
-    return status_obj
+@api.delete("/reminders/{reminder_id}")
+async def delete_reminder(reminder_id: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    await db.reminders.delete_one({'id': reminder_id})
+    return {'success': True}
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    # Exclude MongoDB's _id field from the query results
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
-    
-    # Convert ISO string timestamps back to datetime objects
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
-    
-    return status_checks
 
-# Include the router in the main app
-app.include_router(api_router)
+# ─── RBAC ────────────────────────────────────────────────────────────────────
+@api.get("/roles")
+async def get_roles(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    roles = await db.roles.find({}, {'_id': 0}).sort('name', 1).to_list(None)
+    result = []
+    for r in roles:
+        perms = await db.role_permissions.find({'role_id': r['id']}, {'_id': 0}).to_list(None)
+        result.append({**serialize_doc(r), 'permissions': serialize_doc(perms)})
+    return result
+
+@api.post("/roles")
+async def create_role(request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    existing = await db.roles.find_one({'name': body.get('name')})
+    if existing: raise HTTPException(400, f"Role '{body['name']}' already exists")
+    role = {'id': new_id(), 'name': body['name'], 'description': body.get('description', ''),
+            'is_system': False, 'created_at': now(), 'updated_at': now()}
+    await db.roles.insert_one(role)
+    # Assign permissions
+    for perm_key in body.get('permissions', []):
+        await db.role_permissions.insert_one({
+            'id': new_id(), 'role_id': role['id'], 'permission_key': perm_key, 'created_at': now()
+        })
+    return JSONResponse(serialize_doc(role), status_code=201)
+
+@api.put("/roles/{role_id}")
+async def update_role(role_id: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    await db.roles.update_one({'id': role_id}, {'$set': {
+        'name': body.get('name'), 'description': body.get('description', ''), 'updated_at': now()
+    }})
+    if 'permissions' in body:
+        await db.role_permissions.delete_many({'role_id': role_id})
+        for perm_key in body['permissions']:
+            await db.role_permissions.insert_one({
+                'id': new_id(), 'role_id': role_id, 'permission_key': perm_key, 'created_at': now()
+            })
+    return serialize_doc(await db.roles.find_one({'id': role_id}, {'_id': 0}))
+
+@api.delete("/roles/{role_id}")
+async def delete_role(role_id: str, request: Request):
+    user = require_auth(request)
+    if user.get('role') != 'superadmin': raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    role = await db.roles.find_one({'id': role_id})
+    if role and role.get('is_system'): raise HTTPException(400, 'Cannot delete system role')
+    await db.role_permissions.delete_many({'role_id': role_id})
+    await db.roles.delete_one({'id': role_id})
+    return {'success': True}
+
+@api.get("/permissions")
+async def get_permissions(request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    # Return available permission keys
+    permissions = [
+        {"key": "dashboard.view", "module": "Dashboard", "description": "View dashboard"},
+        {"key": "products.view", "module": "Products", "description": "View products"},
+        {"key": "products.create", "module": "Products", "description": "Create products"},
+        {"key": "products.edit", "module": "Products", "description": "Edit products"},
+        {"key": "products.delete", "module": "Products", "description": "Delete products"},
+        {"key": "garments.view", "module": "Garments", "description": "View vendors"},
+        {"key": "garments.create", "module": "Garments", "description": "Create vendors"},
+        {"key": "garments.edit", "module": "Garments", "description": "Edit vendors"},
+        {"key": "garments.delete", "module": "Garments", "description": "Delete vendors"},
+        {"key": "po.view", "module": "Production PO", "description": "View POs"},
+        {"key": "po.create", "module": "Production PO", "description": "Create POs"},
+        {"key": "po.edit", "module": "Production PO", "description": "Edit POs"},
+        {"key": "po.delete", "module": "Production PO", "description": "Delete POs"},
+        {"key": "po.close", "module": "Production PO", "description": "Close POs"},
+        {"key": "shipment.view", "module": "Shipments", "description": "View shipments"},
+        {"key": "shipment.create", "module": "Shipments", "description": "Create shipments"},
+        {"key": "jobs.view", "module": "Production Jobs", "description": "View production jobs"},
+        {"key": "jobs.create", "module": "Production Jobs", "description": "Create production jobs"},
+        {"key": "progress.view", "module": "Production Progress", "description": "View progress"},
+        {"key": "progress.create", "module": "Production Progress", "description": "Report progress"},
+        {"key": "invoice.view", "module": "Invoices", "description": "View invoices"},
+        {"key": "invoice.create", "module": "Invoices", "description": "Create invoices"},
+        {"key": "invoice.edit", "module": "Invoices", "description": "Edit invoices"},
+        {"key": "payment.view", "module": "Payments", "description": "View payments"},
+        {"key": "payment.create", "module": "Payments", "description": "Create payments"},
+        {"key": "report.view", "module": "Reports", "description": "View reports"},
+        {"key": "report.export", "module": "Reports", "description": "Export reports"},
+        {"key": "users.view", "module": "Users", "description": "View users"},
+        {"key": "users.manage", "module": "Users", "description": "Manage users"},
+        {"key": "roles.manage", "module": "Roles", "description": "Manage roles"},
+        {"key": "accessories.view", "module": "Accessories", "description": "View accessories"},
+        {"key": "accessories.manage", "module": "Accessories", "description": "Manage accessories"},
+        {"key": "requests.approve", "module": "Material Requests", "description": "Approve material requests"},
+        {"key": "settings.manage", "module": "Settings", "description": "Manage company settings"},
+    ]
+    return permissions
+
+# ─── PO ACCESSORIES (add-on) ─────────────────────────────────────────────────
+@api.get("/po-accessories")
+async def get_po_accessories(request: Request):
+    """Get accessories linked to a PO."""
+    require_auth(request)
+    db = get_db()
+    po_id = request.query_params.get('po_id')
+    if not po_id: raise HTTPException(400, 'po_id required')
+    return serialize_doc(await db.po_accessories.find({'po_id': po_id}, {'_id': 0}).sort('created_at', 1).to_list(None))
+
+@api.post("/po-accessories")
+async def add_po_accessory(request: Request):
+    """Add accessory to a PO."""
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    body = await request.json()
+    po_id = body.get('po_id')
+    if not po_id: raise HTTPException(400, 'po_id required')
+    items = body.get('items', [])
+    inserted = []
+    for item in items:
+        acc_doc = {
+            'id': new_id(), 'po_id': po_id,
+            'accessory_id': item.get('accessory_id'),
+            'accessory_name': item.get('accessory_name', ''),
+            'accessory_code': item.get('accessory_code', ''),
+            'qty_needed': int(item.get('qty_needed', 0) or 0),
+            'unit': item.get('unit', 'pcs'),
+            'notes': item.get('notes', ''),
+            'created_at': now()
+        }
+        await db.po_accessories.insert_one(acc_doc)
+        inserted.append(acc_doc)
+    await log_activity(user['id'], user['name'], 'Add Accessories', 'Production PO',
+                       f"Added {len(inserted)} accessories to PO")
+    return JSONResponse(serialize_doc(inserted), status_code=201)
+
+@api.delete("/po-accessories/{acc_id}")
+async def remove_po_accessory(acc_id: str, request: Request):
+    user = require_auth(request)
+    if not check_role(user, ['admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    await db.po_accessories.delete_one({'id': acc_id})
+    return {'success': True}
+
+# ─── RATE LIMITING MIDDLEWARE ────────────────────────────────────────────────
+from collections import defaultdict
+import time as _time
+_rate_limit_store = defaultdict(list)
+_RATE_LIMIT = 200  # requests per minute
+_RATE_WINDOW = 60  # seconds
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    client_ip = request.client.host if request.client else "unknown"
+    current = _time.time()
+    # Clean old entries
+    _rate_limit_store[client_ip] = [t for t in _rate_limit_store[client_ip] if current - t < _RATE_WINDOW]
+    if len(_rate_limit_store[client_ip]) >= _RATE_LIMIT:
+        return JSONResponse({"error": "Rate limit exceeded. Max 200 requests/minute."}, status_code=429)
+    _rate_limit_store[client_ip].append(current)
+    response = await call_next(request)
+    return response
+
+# ─── INCLUDE ROUTERS ─────────────────────────────────────────────────────────
+app.include_router(api)
+
+# Include modular route files
+from routes.buyer_portal import router as buyer_router
+from routes.file_storage import router as file_router
+from routes.websocket import router as ws_router
+app.include_router(buyer_router)
+app.include_router(file_router)
+app.include_router(ws_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,14 +4578,3 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
