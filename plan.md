@@ -1,4 +1,4 @@
-# plan.md — Accessories Flow Fix ✅ + RBAC Fix ✅ + Inspection+Accessories ✅ + PDFs ✅ + Product Photos ✅ + Analytics ✅ + Serial Tracking ✅ + Stabilization/Docs ✅
+# plan.md — Accessories Flow ✅ + RBAC ✅ + Inspection+Accessories ✅ + PDFs ✅ + Product Photos ✅ + Analytics ✅ + Serial Tracking ✅ + Stabilization/Docs ✅ + **Invoice Edit Approval System (P0) ⏳**
 
 ## 1) Objectives
 
@@ -40,8 +40,15 @@
   - Created `/app/DESIGN_TECHNICAL_DOCUMENT.md` with complete architecture + DB + API + feature documentation.
 
 ### Current (Now)
-- System scope for requested v8.0 items is **complete**.
-- Remaining (optional, future): session longevity improvements, backend modularization (split `server.py` into routers), pagination, realtime events.
+- Implement **Invoice Edit Approval System** (P0) untuk menjaga integritas data finansial:
+  - Hanya **Admin ERP** yang bisa mengajukan request edit
+  - Hanya **Superadmin/Admin** yang bisa approve/reject
+  - Jika approved: **invoice auto-update** + **histori perubahan tersimpan** + **UI histori**
+  - **Real-time** notifikasi pending request (MVP: polling badge count di Sidebar)
+
+### Next (After P0)
+- Resolve **Production Monitoring job-level `shipped_qty` display** (P2, currently blocked) dengan refactor endpoint/UI.
+- Optional/future: session longevity, modularization `server.py`, pagination, full realtime via WebSocket.
 
 ---
 
@@ -206,7 +213,7 @@
     2) auto-created material request schema mismatch vs manual requests
   - Both issues fixed ✅
 
-#### 9.2 Evidence
+#### 9.2 Evidence ✅
 - Test reports:
   - `/app/test_reports/iteration_1.json`
   - `/app/test_reports/iteration_2.json`
@@ -232,11 +239,99 @@
 
 ---
 
+### Phase 11 — Invoice Edit Approval System (P0) ⏳ NOT STARTED
+**Goal:** Menambahkan approval flow formal untuk perubahan invoice agar ada kontrol, audit trail, dan notifikasi real-time.
+
+#### 11.1 Scope & Rules
+- **Requester:** hanya **Admin ERP** (bukan vendor/buyer).
+- **Approver:** hanya **Superadmin/Admin**.
+- **Fields:** semua field invoice termasuk `invoice_items`, `discount`, `notes`, `total_amount`, dll.
+- **Approval action:** jika Approved → **invoice auto-update**.
+- **Audit:** simpan histori perubahan lengkap + tautkan ke approval request.
+- **Real-time:** MVP dengan **polling badge count** pending request di Sidebar; WebSocket bisa jadi peningkatan lanjutan.
+
+#### 11.2 Backend (FastAPI + MongoDB)
+1) **DB Collections baru**
+   - `invoice_edit_requests`
+     - Minimal fields:
+       - `id`
+       - `invoice_id`, `invoice_number`, `invoice_category`
+       - `status`: `Pending` | `Approved` | `Rejected`
+       - `requested_by` (user_email), `requested_at`
+       - `approval_notes` (opsional)
+       - `approved_by` (user_email), `approved_at`
+       - `changes_requested`: object (patch) + snapshot `before` dan `after` (untuk diff UI stabil)
+       - `change_summary` (string ringkas untuk list)
+   - `invoice_change_history`
+     - Minimal fields:
+       - `id`, `invoice_id`, `invoice_number`
+       - `changed_by`, `changed_at`
+       - `change_type`: `EDIT_APPROVAL`
+       - `old_values`, `new_values`
+       - `approval_request_id`
+
+2) **API Endpoints (5 endpoint utama)**
+   - `POST /api/invoice-edit-requests`
+     - Buat request edit (hanya admin ERP)
+   - `GET /api/invoice-edit-requests?status=&q=&from=&to=`
+     - List request (untuk dashboard approval)
+   - `GET /api/invoice-edit-requests/{id}`
+     - Detail request + diff
+   - `PUT /api/invoice-edit-requests/{id}/approve`
+     - Approve + **auto-update invoice** + insert `invoice_change_history`
+   - `PUT /api/invoice-edit-requests/{id}/reject`
+     - Reject + simpan `approval_notes`
+
+3) **Hardening & Consistency**
+   - Wajib atomicity semampunya di Mongo:
+     - Update status request → update invoice → insert history (gunakan best-effort ordering + kompensasi bila gagal)
+   - Validasi: request hanya boleh untuk invoice yang tidak `Superseded` (dan opsional: tidak `Paid` jika diinginkan)
+   - Logging: insert `activity_logs` untuk submit/approve/reject.
+
+#### 11.3 Frontend (React)
+1) **Module baru:** `ApprovalModule.jsx`
+   - List `Pending/Approved/Rejected` + filter
+   - Detail panel: tabel perbandingan **Before vs After** (highlight perubahan)
+   - Tombol Approve/Reject + input notes
+   - Shortcut link/buton: buka invoice detail terkait
+
+2) **Update existing invoice UI**
+   - `ManualInvoiceModule.jsx`:
+     - Tambah tombol **Request Edit** (membuka modal form edit + preview changes)
+     - Tambah tombol/tab **Histori Perubahan** (read-only dari `invoice_change_history`)
+     - Setelah submit request: invoice tidak berubah sampai approved
+
+3) **Sidebar badge + polling realtime (MVP)**
+   - Tambahkan count `Pending` di menu Approval
+   - Polling interval (contoh 15–30 detik):
+     - Endpoint ringkas (opsional): `GET /api/invoice-edit-requests/count?status=Pending`
+     - Atau pakai list endpoint dengan limit minimal
+
+#### 11.4 RBAC
+- Permission/role enforcement:
+  - `superadmin`, `admin`:
+    - access approval module
+    - approve/reject
+    - submit request edit
+- Catatan: jika nanti ingin granular permissions, bisa ditambahkan `permissions` baru:
+  - `finance.invoice_edit.request`
+  - `finance.invoice_edit.approve`
+
+#### 11.5 Testing (wajib both)
+- Gunakan testing agent untuk verifikasi end-to-end:
+  1) Admin submit request edit invoice (perubahan item qty/harga/notes)
+  2) Request muncul di Approval dashboard (Pending)
+  3) Approver approve → invoice ter-update otomatis
+  4) `invoice_change_history` tercatat dan dapat dilihat via UI
+  5) Badge pending turun (polling)
+  6) Negative tests: reject flow, approve double-click/idempotency, request pada invoice Superseded
+
+---
+
 ## 3) Next Actions
 
-### P0 (Done)
-- ✅ Comprehensive testing executed and issues fixed.
-- ✅ Technical documentation created.
+### P0 (Current)
+1) Implement **Phase 11 — Invoice Edit Approval System** (backend + frontend + polling realtime) dan lakukan testing end-to-end.
 
 ### P1 (Optional / Future)
 1) **Session stability improvements**
@@ -246,7 +341,7 @@
 3) **Server-side pagination**
    - For large lists (PO, shipments, jobs, logs).
 4) **Real-time updates (WebSocket)**
-   - Broadcast key operations (inspection submitted, job status changes).
+   - Broadcast key operations (inspection submitted, job status changes, approval events, dll).
 5) **Photo storage improvement**
    - Migrate from base64-in-Mongo to object storage.
 
@@ -268,8 +363,17 @@
 - Frontend builds successfully.
 - `DESIGN_TECHNICAL_DOCUMENT.md` exists and matches latest behavior.
 
+### New (Target for Phase 11)
+- Admin dapat membuat **request edit invoice** tanpa mengubah invoice langsung.
+- Superadmin/Admin dapat **approve/reject** request dari dashboard.
+- Saat approved, invoice **auto-update** dan sistem menyimpan **invoice_change_history**.
+- UI menyediakan **Histori Perubahan** invoice.
+- Sidebar menampilkan **badge pending** dan update secara near real-time via polling.
+- Semua aksi terekam di `activity_logs`.
+
 ### Optional follow-ups
 - Vendor portal includes full serial list module.
 - Product thumbnails fully consistent across all downstream modules.
 - Token/session UX improved for long sessions.
 - Endpoint pagination and modular routes for maintainability.
+- Upgrade polling → WebSocket realtime untuk approval notifications.

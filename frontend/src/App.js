@@ -31,6 +31,7 @@ import RoleManagementModule from './components/erp/RoleManagementModule';
 import BuyerPortalApp from './components/erp/BuyerPortalApp';
 import BuyersModule from './components/erp/BuyersModule';
 import PDFConfigModule from './components/erp/PDFConfigModule';
+import ApprovalModule from './components/erp/ApprovalModule';
 import { Search, X } from 'lucide-react';
 
 function App() {
@@ -40,6 +41,9 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [paymentPrefill, setPaymentPrefill] = useState(null);
   const [loading, setLoading] = useState(true);
+
+  // Approval badge polling
+  const [pendingApprovalsCount, setPendingApprovalsCount] = useState(0);
 
   // Global search state
   const [searchQuery, setSearchQuery] = useState('');
@@ -63,6 +67,30 @@ function App() {
     }
     setLoading(false);
   }, []);
+
+  // Polling for pending approval count (only for superadmin/admin)
+  useEffect(() => {
+    if (!token || !user) return;
+    if (!['superadmin', 'admin'].includes(user.role)) return;
+
+    const fetchPendingCount = async () => {
+      try {
+        const res = await fetch('/api/invoice-edit-requests?status=Pending', {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const data = await res.json();
+        setPendingApprovalsCount(Array.isArray(data) ? data.length : 0);
+      } catch (e) {
+        console.error('Error fetching pending approvals:', e);
+      }
+    };
+
+    fetchPendingCount(); // Initial fetch
+    const interval = setInterval(fetchPendingCount, 30000); // Poll every 30s
+
+    return () => clearInterval(interval);
+  }, [token, user]);
+
 
   const handleLogin = useCallback((tokenData, userData) => {
     setToken(tokenData);
@@ -175,6 +203,7 @@ function App() {
       case 'accounts-payable': return <AccountsPayableModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
       case 'accounts-receivable': return <AccountsReceivableModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
       case 'manual-invoice': return <ManualInvoiceModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
+      case 'invoice-approval': return <ApprovalModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
       case 'invoices': return <InvoiceModule token={token} userRole={user?.role} onNavigate={handleNavigate} hasPerm={hasPerm} />;
       case 'payments': return <PaymentModule token={token} userRole={user?.role} prefillInvoice={paymentPrefill} hasPerm={hasPerm} />;
       case 'financial-recap': return <FinancialRecapModule token={token} userRole={user?.role} hasPerm={hasPerm} />;
@@ -207,6 +236,7 @@ function App() {
         onLogout={handleLogout}
         collapsed={sidebarCollapsed}
         onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
+        pendingApprovalsCount={pendingApprovalsCount}
       />
       <div className={`flex-1 flex flex-col min-h-0 transition-all duration-300 ${sidebarCollapsed ? 'ml-16' : 'ml-64'}`}>
         {/* Top bar */}

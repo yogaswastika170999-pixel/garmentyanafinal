@@ -1,10 +1,50 @@
 [
   {
-    "content": "Activity Log filter by user - Backend & Frontend",
+    "content": "Backend: Create invoice_edit_requests & invoice_change_history collections schema in server.py",
     "status": "completed"
   },
   {
-    "content": "Invoice Edit Approval System (backend + frontend) - FINAL MAJOR FEATURE",
+    "content": "Backend: POST /api/invoice-edit-requests endpoint (create request)",
+    "status": "completed"
+  },
+  {
+    "content": "Backend: GET /api/invoice-edit-requests endpoint (list + filters)",
+    "status": "completed"
+  },
+  {
+    "content": "Backend: GET /api/invoice-edit-requests/{id} endpoint (detail)",
+    "status": "completed"
+  },
+  {
+    "content": "Backend: PUT /api/invoice-edit-requests/{id}/approve endpoint (approve + auto-update invoice + insert history)",
+    "status": "completed"
+  },
+  {
+    "content": "Backend: PUT /api/invoice-edit-requests/{id}/reject endpoint (reject)",
+    "status": "completed"
+  },
+  {
+    "content": "Backend: GET /api/invoices/{id}/change-history endpoint (read history)",
+    "status": "completed"
+  },
+  {
+    "content": "Frontend: Create ApprovalModule.jsx (list, detail, approve/reject UI)",
+    "status": "completed"
+  },
+  {
+    "content": "Frontend: Update ManualInvoiceModule.jsx (add Request Edit button + history tab)",
+    "status": "completed"
+  },
+  {
+    "content": "Frontend: Add Approval module to App.js routing + Sidebar with badge polling",
+    "status": "completed"
+  },
+  {
+    "content": "Testing: Run testing_agent_v3 for comprehensive end-to-end approval flow verification",
+    "status": "in_progress"
+  },
+  {
+    "content": "Fix bugs reported by testing agent (if any)",
     "status": "pending"
   }
 ]

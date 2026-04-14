@@ -75,6 +75,12 @@ async def create_indexes():
         # RBAC indexes
         await db.roles.create_index("name", unique=True)
         await db.permissions.create_index("key", unique=True)
+        # Invoice edit approval indexes
+        await db.invoice_edit_requests.create_index("invoice_id")
+        await db.invoice_edit_requests.create_index("status")
+        await db.invoice_edit_requests.create_index("requested_at")
+        await db.invoice_change_history.create_index("invoice_id")
+        await db.invoice_change_history.create_index("changed_at")
         logger.info("MongoDB indexes created")
     except Exception as e:
         logger.warning(f"Index creation warning: {e}")
@@ -1636,6 +1642,220 @@ async def delete_adjustment(adj_id: str, request: Request):
             'total_amount': new_total, 'remaining_balance': new_total - (invoice.get('total_paid', 0)), 'updated_at': now()
         }})
     return {'success': True}
+
+# ─── INVOICE EDIT REQUESTS (APPROVAL SYSTEM) ─────────────────────────────────
+@api.get("/invoice-edit-requests")
+async def get_invoice_edit_requests(request: Request):
+    user = await require_auth(request)
+    if not check_role(user, ['superadmin', 'admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    sp = request.query_params
+    query = {}
+    if sp.get('status'): query['status'] = sp['status']
+    if sp.get('invoice_id'): query['invoice_id'] = sp['invoice_id']
+    if sp.get('q'):
+        q = sp['q']
+        query['$or'] = [
+            {'invoice_number': {'$regex': q, '$options': 'i'}},
+            {'requested_by': {'$regex': q, '$options': 'i'}},
+            {'change_summary': {'$regex': q, '$options': 'i'}}
+        ]
+    if sp.get('from') or sp.get('to'):
+        query['requested_at'] = {}
+        if sp.get('from'): query['requested_at']['$gte'] = parse_date(sp['from'])
+        if sp.get('to'): query['requested_at']['$lte'] = to_end_of_day(sp['to'])
+    return serialize_doc(await db.invoice_edit_requests.find(query, {'_id': 0}).sort('requested_at', -1).to_list(None))
+
+@api.get("/invoice-edit-requests/{req_id}")
+async def get_invoice_edit_request(req_id: str, request: Request):
+    user = await require_auth(request)
+    if not check_role(user, ['superadmin', 'admin']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    req = await db.invoice_edit_requests.find_one({'id': req_id}, {'_id': 0})
+    if not req: raise HTTPException(404, 'Request not found')
+    return serialize_doc(req)
+
+@api.post("/invoice-edit-requests")
+async def create_invoice_edit_request(request: Request):
+    user = await require_auth(request)
+    if not check_role(user, ['superadmin', 'admin']): raise HTTPException(403, 'Forbidden: Hanya Admin yang bisa mengajukan request edit')
+    db = get_db()
+    body = await request.json()
+    invoice_id = body.get('invoice_id')
+    if not invoice_id: raise HTTPException(400, 'invoice_id wajib diisi')
+    
+    # Get current invoice
+    invoice = await db.invoices.find_one({'id': invoice_id})
+    if not invoice: raise HTTPException(404, 'Invoice tidak ditemukan')
+    if invoice.get('status') == 'Superseded': raise HTTPException(400, 'Tidak bisa mengedit invoice yang sudah Superseded')
+    
+    # Check if there's already a pending request for this invoice
+    existing_pending = await db.invoice_edit_requests.find_one({
+        'invoice_id': invoice_id,
+        'status': 'Pending'
+    })
+    if existing_pending:
+        raise HTTPException(400, f"Sudah ada request edit pending untuk invoice {invoice.get('invoice_number')}. Tunggu hingga di-approve/reject terlebih dahulu.")
+    
+    # Prepare changes (what user wants to change)
+    changes_requested = body.get('changes_requested', {})
+    if not changes_requested:
+        raise HTTPException(400, 'changes_requested wajib diisi (object berisi field yang ingin diubah)')
+    
+    # Create before snapshot (current state)
+    before_snapshot = {
+        'invoice_items': invoice.get('invoice_items', []),
+        'discount': invoice.get('discount', 0),
+        'notes': invoice.get('notes', ''),
+        'total_amount': invoice.get('total_amount', 0)
+    }
+    
+    # Create after snapshot (proposed state) - merge current with changes
+    after_snapshot = {**before_snapshot, **changes_requested}
+    
+    # Generate change summary
+    change_summary = body.get('change_summary', 'Edit invoice items/fields')
+    
+    edit_request = {
+        'id': new_id(),
+        'invoice_id': invoice_id,
+        'invoice_number': invoice.get('invoice_number'),
+        'invoice_category': invoice.get('invoice_category'),
+        'po_number': invoice.get('po_number'),
+        'status': 'Pending',
+        'requested_by': user['email'],
+        'requested_by_name': user['name'],
+        'requested_at': now(),
+        'approved_by': None,
+        'approved_by_name': None,
+        'approved_at': None,
+        'approval_notes': '',
+        'changes_requested': changes_requested,
+        'before_snapshot': before_snapshot,
+        'after_snapshot': after_snapshot,
+        'change_summary': change_summary,
+        'created_at': now(),
+        'updated_at': now()
+    }
+    
+    await db.invoice_edit_requests.insert_one(edit_request)
+    await log_activity(user['id'], user['name'], 'Request Invoice Edit', 'Invoice Approval', 
+                      f"Request edit untuk invoice {invoice.get('invoice_number')}")
+    return JSONResponse(serialize_doc(edit_request), status_code=201)
+
+@api.put("/invoice-edit-requests/{req_id}/approve")
+async def approve_invoice_edit_request(req_id: str, request: Request):
+    user = await require_auth(request)
+    if not check_role(user, ['superadmin', 'admin']): raise HTTPException(403, 'Forbidden: Hanya Superadmin/Admin yang bisa approve')
+    db = get_db()
+    body = await request.json()
+    
+    # Get request
+    edit_req = await db.invoice_edit_requests.find_one({'id': req_id})
+    if not edit_req: raise HTTPException(404, 'Request tidak ditemukan')
+    if edit_req.get('status') != 'Pending':
+        raise HTTPException(400, f"Request sudah {edit_req.get('status')}. Tidak bisa approve lagi.")
+    
+    # Get invoice
+    invoice = await db.invoices.find_one({'id': edit_req['invoice_id']})
+    if not invoice: raise HTTPException(404, 'Invoice tidak ditemukan')
+    
+    # Prepare update payload from changes_requested
+    changes = edit_req.get('changes_requested', {})
+    update_payload = {**changes, 'updated_at': now()}
+    
+    # If invoice_items changed, recalculate total
+    if 'invoice_items' in changes:
+        items = changes['invoice_items']
+        category = invoice.get('invoice_category')
+        recalc_items = []
+        for it in items:
+            price = it.get('cmt_price', 0) if category == 'VENDOR' else it.get('selling_price', 0)
+            qty = it.get('invoice_qty', it.get('qty', 0))
+            recalc_items.append({**it, 'invoice_qty': qty, 'subtotal': qty * price})
+        total_amount = sum(i['subtotal'] for i in recalc_items) - float(changes.get('discount', invoice.get('discount', 0)) or 0)
+        update_payload['invoice_items'] = recalc_items
+        update_payload['total_amount'] = total_amount
+        update_payload['remaining_balance'] = total_amount - (invoice.get('total_paid', 0))
+        # Update status based on payment
+        if invoice.get('total_paid', 0) >= total_amount:
+            update_payload['status'] = 'Paid'
+        elif invoice.get('total_paid', 0) > 0:
+            update_payload['status'] = 'Partial'
+        else:
+            update_payload['status'] = 'Unpaid'
+    
+    # Update invoice
+    await db.invoices.update_one({'id': edit_req['invoice_id']}, {'$set': update_payload})
+    
+    # Create change history record
+    history = {
+        'id': new_id(),
+        'invoice_id': edit_req['invoice_id'],
+        'invoice_number': invoice.get('invoice_number'),
+        'changed_by': user['email'],
+        'changed_by_name': user['name'],
+        'changed_at': now(),
+        'change_type': 'EDIT_APPROVAL',
+        'old_values': edit_req.get('before_snapshot', {}),
+        'new_values': edit_req.get('after_snapshot', {}),
+        'approval_request_id': req_id,
+        'notes': body.get('approval_notes', '')
+    }
+    await db.invoice_change_history.insert_one(history)
+    
+    # Update request status
+    await db.invoice_edit_requests.update_one({'id': req_id}, {'$set': {
+        'status': 'Approved',
+        'approved_by': user['email'],
+        'approved_by_name': user['name'],
+        'approved_at': now(),
+        'approval_notes': body.get('approval_notes', ''),
+        'updated_at': now()
+    }})
+    
+    await log_activity(user['id'], user['name'], 'Approve Invoice Edit', 'Invoice Approval',
+                      f"Approved edit untuk invoice {invoice.get('invoice_number')}")
+    
+    return {'success': True, 'message': 'Request approved dan invoice berhasil diupdate'}
+
+@api.put("/invoice-edit-requests/{req_id}/reject")
+async def reject_invoice_edit_request(req_id: str, request: Request):
+    user = await require_auth(request)
+    if not check_role(user, ['superadmin', 'admin']): raise HTTPException(403, 'Forbidden: Hanya Superadmin/Admin yang bisa reject')
+    db = get_db()
+    body = await request.json()
+    
+    # Get request
+    edit_req = await db.invoice_edit_requests.find_one({'id': req_id})
+    if not edit_req: raise HTTPException(404, 'Request tidak ditemukan')
+    if edit_req.get('status') != 'Pending':
+        raise HTTPException(400, f"Request sudah {edit_req.get('status')}. Tidak bisa reject lagi.")
+    
+    # Update request status
+    await db.invoice_edit_requests.update_one({'id': req_id}, {'$set': {
+        'status': 'Rejected',
+        'approved_by': user['email'],
+        'approved_by_name': user['name'],
+        'approved_at': now(),
+        'approval_notes': body.get('approval_notes', 'Request ditolak'),
+        'updated_at': now()
+    }})
+    
+    await log_activity(user['id'], user['name'], 'Reject Invoice Edit', 'Invoice Approval',
+                      f"Rejected edit request untuk invoice {edit_req.get('invoice_number')}")
+    
+    return {'success': True, 'message': 'Request rejected'}
+
+# ─── INVOICE CHANGE HISTORY ──────────────────────────────────────────────────
+@api.get("/invoices/{invoice_id}/change-history")
+async def get_invoice_change_history(invoice_id: str, request: Request):
+    user = await require_auth(request)
+    if not check_role(user, ['superadmin', 'admin', 'finance']): raise HTTPException(403, 'Forbidden')
+    db = get_db()
+    history = await db.invoice_change_history.find({'invoice_id': invoice_id}, {'_id': 0}).sort('changed_at', -1).to_list(None)
+    return serialize_doc(history)
+
 
 # ─── PAYMENTS ────────────────────────────────────────────────────────────────
 @api.get("/payments")

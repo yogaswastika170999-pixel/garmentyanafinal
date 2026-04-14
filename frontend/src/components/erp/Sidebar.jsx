@@ -45,6 +45,7 @@ const menuItems = [
       { id: 'accounts-payable', label: 'Hutang Vendor (AP)', icon: CreditCard, perm: 'invoice.view' },
       { id: 'accounts-receivable', label: 'Piutang Buyer (AR)', icon: TrendingUp, perm: 'invoice.view' },
       { id: 'manual-invoice', label: 'Invoice Manual', icon: Pencil, perm: 'invoice.create' },
+      { id: 'invoice-approval', label: 'Invoice Edit Approval', icon: Shield, roles: ['superadmin', 'admin'], badge: 'pending_approvals' },
       { id: 'invoices', label: 'Semua Invoice', icon: FileText, perm: 'invoice.view' },
       { id: 'payments', label: 'Manajemen Pembayaran', icon: DollarSign, perm: 'payment.view' },
       { id: 'financial-recap', label: 'Rekap Keuangan', icon: BarChart3, perm: 'report.view' },
@@ -69,7 +70,7 @@ const menuItems = [
   }
 ];
 
-export default function Sidebar({ currentModule, onModuleChange, user, onLogout, collapsed, onToggle }) {
+export default function Sidebar({ currentModule, onModuleChange, user, onLogout, collapsed, onToggle, pendingApprovalsCount }) {
   const [userPerms, setUserPerms] = useState([]);
 
   // Fetch user permissions on mount
@@ -146,6 +147,7 @@ export default function Sidebar({ currentModule, onModuleChange, user, onLogout,
               {visibleItems.map((item) => {
                 const Icon = item.icon;
                 const isActive = currentModule === item.id;
+                const badgeCount = item.badge === 'pending_approvals' ? pendingApprovalsCount : 0;
                 return (
                   <button key={item.id} onClick={() => onModuleChange(item.id)}
                     className={`w-full flex items-center gap-3 px-4 py-2.5 text-sm transition-colors ${
@@ -154,7 +156,12 @@ export default function Sidebar({ currentModule, onModuleChange, user, onLogout,
                     title={collapsed ? item.label : ''}>
                     <Icon className="w-5 h-5 flex-shrink-0" />
                     {!collapsed && <span className="truncate">{item.label}</span>}
-                    {!collapsed && isActive && <ChevronRight className="w-4 h-4 ml-auto flex-shrink-0" />}
+                    {!collapsed && badgeCount > 0 && (
+                      <span className="ml-auto px-2 py-0.5 bg-amber-500 text-white rounded-full text-xs font-bold flex-shrink-0">
+                        {badgeCount}
+                      </span>
+                    )}
+                    {!collapsed && isActive && badgeCount === 0 && <ChevronRight className="w-4 h-4 ml-auto flex-shrink-0" />}
                   </button>
                 );
               })}

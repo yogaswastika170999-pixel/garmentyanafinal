@@ -1,6 +1,6 @@
 
 import { useState, useEffect } from 'react';
-import { Plus, FileText, RefreshCw, Eye, Edit3, ChevronRight, AlertCircle, CheckCircle, Pencil, ArrowUpCircle, ArrowDownCircle, Trash2 } from 'lucide-react';
+import { Plus, FileText, RefreshCw, Eye, Edit3, ChevronRight, AlertCircle, CheckCircle, Pencil, ArrowUpCircle, ArrowDownCircle, Trash2, History, Send } from 'lucide-react';
 import Modal from './Modal';
 import SearchableSelect from './SearchableSelect';
 import ImportExportPanel from './ImportExportPanel';
@@ -50,6 +50,21 @@ export default function ManualInvoiceModule({ token, userRole }) {
   const [showAdjustment, setShowAdjustment] = useState(false);
   const [adjForm, setAdjForm] = useState({ adjustment_type: 'ADD', amount: '', reason: '', notes: '', reference_event: '' });
   const [adjSaving, setAdjSaving] = useState(false);
+
+  // Request Edit form
+  const [showRequestEdit, setShowRequestEdit] = useState(false);
+  const [requestEditForm, setRequestEditForm] = useState({
+    invoice_items: [],
+    discount: 0,
+    notes: '',
+    change_summary: ''
+  });
+  const [requestEditSaving, setRequestEditSaving] = useState(false);
+
+  // Change History
+  const [showHistory, setShowHistory] = useState(false);
+  const [changeHistory, setChangeHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
 
   const canEdit = ['superadmin', 'admin', 'finance'].includes(userRole);
 
@@ -127,6 +142,96 @@ export default function ManualInvoiceModule({ token, userRole }) {
   const totalBeforeDiscount = invoiceItems.reduce((s, it) => s + getSubtotal(it), 0);
   const discountAmt = Number(createForm.discount) || 0;
   const totalAfterDiscount = totalBeforeDiscount - discountAmt;
+
+
+  // Request Edit functions
+  const openRequestEdit = (inv) => {
+    setSelectedInv(inv);
+    setRequestEditForm({
+      invoice_items: (inv.invoice_items || []).map(it => ({ ...it })),
+      discount: inv.discount || 0,
+      notes: inv.notes || '',
+      change_summary: ''
+    });
+    setShowRequestEdit(true);
+  };
+
+  const updateRequestEditItem = (idx, field, value) => {
+    setRequestEditForm(f => {
+      const items = [...f.invoice_items];
+      items[idx] = { ...items[idx], [field]: value };
+      return { ...f, invoice_items: items };
+    });
+  };
+
+  const getRequestEditSubtotal = (item) => {
+    const qty = Number(item.invoice_qty) || 0;
+    const price = selectedInv?.invoice_category === 'VENDOR' ? (Number(item.cmt_price) || 0) : (Number(item.selling_price) || 0);
+    return qty * price;
+  };
+
+  const requestEditTotalBeforeDiscount = requestEditForm.invoice_items.reduce((s, it) => s + getRequestEditSubtotal(it), 0);
+  const requestEditTotalAfterDiscount = requestEditTotalBeforeDiscount - Number(requestEditForm.discount || 0);
+
+  const handleRequestEdit = async (e) => {
+    e.preventDefault();
+    if (!requestEditForm.change_summary.trim()) {
+      alert('Ringkasan perubahan wajib diisi');
+      return;
+    }
+    if (!confirm(`Submit request edit untuk invoice ${selectedInv.invoice_number}?\n\nInvoice tidak akan berubah sampai request di-approve oleh Superadmin/Admin.`)) return;
+    setRequestEditSaving(true);
+    try {
+      const res = await fetch('/api/invoice-edit-requests', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          invoice_id: selectedInv.id,
+          change_summary: requestEditForm.change_summary,
+          changes_requested: {
+            invoice_items: requestEditForm.invoice_items,
+            discount: Number(requestEditForm.discount),
+            notes: requestEditForm.notes,
+            total_amount: requestEditTotalAfterDiscount
+          }
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'Gagal submit request edit');
+      } else {
+        alert('Request edit berhasil disubmit! Tunggu approval dari Superadmin/Admin.');
+        setShowRequestEdit(false);
+        fetchAll();
+      }
+    } catch (e) {
+      alert('Error: ' + e.message);
+    } finally {
+      setRequestEditSaving(false);
+    }
+  };
+
+  // Change History functions
+  const openHistory = async (inv) => {
+    setSelectedInv(inv);
+    setShowHistory(true);
+    setHistoryLoading(true);
+    try {
+      const res = await fetch(`/api/invoices/${inv.id}/change-history`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const data = await res.json();
+      setChangeHistory(Array.isArray(data) ? data : []);
+    } catch (e) {
+      console.error('Error fetching history:', e);
+      setChangeHistory([]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
 
   const handleCreate = async (e) => {
     e.preventDefault();
@@ -534,6 +639,26 @@ export default function ManualInvoiceModule({ token, userRole }) {
       {showDetail && selectedInv && (
         <Modal title={`Detail: ${selectedInv.invoice_number}`} onClose={() => { setShowDetail(false); setShowAdjustment(false); }} size="xl">
           <div className="space-y-4">
+            {/* Action Buttons */}
+            {canEdit && selectedInv.status !== 'Superseded' && (
+              <div className="flex gap-2 pb-3 border-b border-slate-200">
+                <button
+                  onClick={() => openRequestEdit(selectedInv)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-600 text-white rounded-lg text-sm hover:bg-purple-700"
+                  data-testid="request-edit-button"
+                >
+                  <Send className="w-3.5 h-3.5" /> Request Edit
+                </button>
+                <button
+                  onClick={() => openHistory(selectedInv)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"
+                  data-testid="view-history-button"
+                >
+                  <History className="w-3.5 h-3.5" /> Histori Perubahan
+                </button>
+              </div>
+            )}
+
             <div className="grid grid-cols-3 gap-3">
               {[
                 { l: 'No. Invoice', v: <span className="font-bold text-blue-700">{selectedInv.invoice_number}</span> },
@@ -804,6 +929,157 @@ export default function ManualInvoiceModule({ token, userRole }) {
           </form>
         </Modal>
       )}
+
+      {/* REQUEST EDIT Modal */}
+      {showRequestEdit && selectedInv && (
+        <Modal title={`Request Edit: ${selectedInv.invoice_number}`} onClose={() => setShowRequestEdit(false)} size="xl">
+          <form onSubmit={handleRequestEdit} className="space-y-4">
+            <div className="bg-purple-50 border border-purple-200 rounded-lg p-3 text-sm text-purple-700">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                <div>
+                  <p className="font-semibold">Perhatian: Request Edit (Approval System)</p>
+                  <p className="mt-1">• Request ini <strong>TIDAK</strong> langsung mengubah invoice.</p>
+                  <p>• Superadmin/Admin akan me-review request Anda di <strong>Invoice Edit Approval</strong> module.</p>
+                  <p>• Jika di-approve, invoice akan diupdate otomatis + histori perubahan tersimpan.</p>
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Ringkasan Perubahan *</label>
+              <input
+                required
+                className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm"
+                value={requestEditForm.change_summary}
+                onChange={e => setRequestEditForm(f => ({ ...f, change_summary: e.target.value }))}
+                placeholder="Contoh: Penyesuaian qty sesuai kesepakatan customer, perubahan harga negosiasi..."
+              />
+            </div>
+
+            {requestEditForm.invoice_items.length > 0 && (
+              <div className="overflow-x-auto rounded-xl border border-slate-200">
+                <table className="w-full text-sm">
+                  <thead className="bg-slate-50">
+                    <tr>
+                      <th className="text-left px-3 py-2 text-xs text-slate-500">SKU / Produk</th>
+                      <th className="text-right px-3 py-2 text-xs text-slate-500">Invoice Qty</th>
+                      <th className="text-right px-3 py-2 text-xs text-slate-500">Selling Price</th>
+                      <th className="text-right px-3 py-2 text-xs text-slate-500">CMT Price</th>
+                      <th className="text-right px-3 py-2 text-xs font-bold text-slate-700">Subtotal</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {requestEditForm.invoice_items.map((item, idx) => (
+                      <tr key={idx} className="border-t border-slate-100">
+                        <td className="px-3 py-2">
+                          <p className="font-medium">{item.product_name}</p>
+                          <p className="text-xs font-mono text-blue-600">{item.sku} · {item.size}/{item.color}</p>
+                        </td>
+                        <td className="px-3 py-2">
+                          <input type="number" min="0" className="w-20 border border-blue-200 rounded px-2 py-1 text-sm text-right ml-auto block"
+                            value={item.invoice_qty} onChange={e => updateRequestEditItem(idx, 'invoice_qty', e.target.value)} />
+                        </td>
+                        <td className="px-3 py-2">
+                          <input type="number" min="0" className="w-28 border border-emerald-200 rounded px-2 py-1 text-sm text-right ml-auto block"
+                            value={item.selling_price} onChange={e => updateRequestEditItem(idx, 'selling_price', e.target.value)} />
+                        </td>
+                        <td className="px-3 py-2">
+                          <input type="number" min="0" className="w-28 border border-amber-200 rounded px-2 py-1 text-sm text-right ml-auto block"
+                            value={item.cmt_price} onChange={e => updateRequestEditItem(idx, 'cmt_price', e.target.value)} />
+                        </td>
+                        <td className="px-3 py-2 text-right font-bold">{fmt(getRequestEditSubtotal(item))}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot className="bg-slate-50 border-t-2 border-slate-200">
+                    <tr>
+                      <td colSpan={4} className="px-3 py-2 font-bold">Subtotal</td>
+                      <td className="px-3 py-2 text-right font-bold">{fmt(requestEditTotalBeforeDiscount)}</td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">Diskon (Rp)</label>
+                <input type="number" min="0" className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm"
+                  value={requestEditForm.discount} onChange={e => setRequestEditForm(f => ({ ...f, discount: e.target.value }))} />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">Total Setelah Diskon</label>
+                <div className="w-full border border-purple-300 bg-purple-50 rounded-lg px-3 py-2 text-sm font-bold text-purple-700">
+                  {fmt(requestEditTotalAfterDiscount)}
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Catatan</label>
+              <textarea rows="2" className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm"
+                value={requestEditForm.notes} onChange={e => setRequestEditForm(f => ({ ...f, notes: e.target.value }))} />
+            </div>
+
+            <div className="flex gap-3">
+              <button type="submit" disabled={requestEditSaving} className="flex-1 bg-purple-600 text-white py-2 rounded-lg text-sm font-medium hover:bg-purple-700 disabled:opacity-50">
+                {requestEditSaving ? 'Mengirim...' : 'Submit Request Edit'}
+              </button>
+              <button type="button" onClick={() => setShowRequestEdit(false)} className="flex-1 border border-slate-200 py-2 rounded-lg text-sm">Batal</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {/* CHANGE HISTORY Modal */}
+      {showHistory && selectedInv && (
+        <Modal title={`Histori Perubahan: ${selectedInv.invoice_number}`} onClose={() => setShowHistory(false)} size="lg">
+          <div className="space-y-4">
+            {historyLoading ? (
+              <div className="text-center py-8">
+                <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2 text-slate-400" />
+                <p className="text-slate-400 text-sm">Memuat histori...</p>
+              </div>
+            ) : changeHistory.length === 0 ? (
+              <div className="text-center py-8 text-slate-400">
+                <History className="w-10 h-10 mx-auto mb-2 opacity-30" />
+                <p className="font-medium">Belum ada histori perubahan</p>
+                <p className="text-xs mt-1">Histori akan tercatat saat ada approval request edit</p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {changeHistory.map((history, idx) => (
+                  <div key={history.id || idx} className="bg-slate-50 border border-slate-200 rounded-lg p-4">
+                    <div className="flex items-start justify-between mb-2">
+                      <div>
+                        <p className="font-semibold text-slate-700">{history.change_type}</p>
+                        <p className="text-xs text-slate-500">
+                          {history.changed_by_name} ({history.changed_by}) • {fmtDate(history.changed_at)}
+                        </p>
+                      </div>
+                      <span className="px-2 py-0.5 rounded-full text-xs bg-blue-100 text-blue-700">
+                        {history.change_type}
+                      </span>
+                    </div>
+                    {history.notes && (
+                      <div className="bg-white rounded p-2 text-sm text-slate-600 mb-2">
+                        <strong>Catatan:</strong> {history.notes}
+                      </div>
+                    )}
+                    {history.approval_request_id && (
+                      <p className="text-xs text-slate-400">
+                        Request ID: {history.approval_request_id}
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </Modal>
+      )}
+
     </div>
   );
 }
