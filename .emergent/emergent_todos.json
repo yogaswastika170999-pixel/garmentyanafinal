@@ -1,10 +1,34 @@
 [
   {
-    "content": "Create OverproductionModule.jsx dengan list, filters, stats, dan update status",
+    "content": "Fix RBAC: hasPerm is not defined error di VendorShipmentModule",
     "status": "completed"
   },
   {
-    "content": "Test end-to-end variance flow (vendor create → admin review)",
-    "status": "completed"
+    "content": "Fix RBAC: test role user button Buat PO tidak muncul",
+    "status": "in_progress"
+  },
+  {
+    "content": "Fix Monitoring Produksi: kolom Dikirim masih 0",
+    "status": "pending"
+  },
+  {
+    "content": "Fix Invoice: bug revisi invoice tidak bisa",
+    "status": "pending"
+  },
+  {
+    "content": "Feature: Variance table di Invoice Buyer & Vendor",
+    "status": "pending"
+  },
+  {
+    "content": "Feature: Invoice Edit Approval System (backend + frontend)",
+    "status": "pending"
+  },
+  {
+    "content": "Feature: Update invoice/shipment numbering dengan PO number",
+    "status": "pending"
+  },
+  {
+    "content": "Feature: Activity Log filter by user",
+    "status": "pending"
   }
 ]

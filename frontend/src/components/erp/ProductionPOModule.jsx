@@ -34,7 +34,7 @@ export default function ProductionPOModule({ token, userRole, hasPerm = () => fa
 
   const isSuperAdmin = userRole === 'superadmin';
   const canEdit = ['superadmin', 'admin'].includes(userRole) || hasPerm('po.edit');
-  const canCreate = ['superadmin', 'admin'].includes(userRole) || hasPerm('po.create');
+  const canCreate = ['superadmin', 'admin'].includes(userRole) || hasPerm('production_po.create') || hasPerm('po.create');
   const canDelete = ['superadmin', 'admin'].includes(userRole) || hasPerm('po.delete');
 
   useEffect(() => { fetchPOs(); fetchProducts(); fetchVendors(); fetchBuyers(); fetchAccessories(); }, []);

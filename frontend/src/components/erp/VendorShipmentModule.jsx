@@ -44,7 +44,7 @@ export default function VendorShipmentModule({ token, userRole, hasPerm = () => 
       </div>
 
       {/* Tab Content */}
-      {activeTab === 'shipments' && <ShipmentList token={token} userRole={userRole} />}
+      {activeTab === 'shipments' && <ShipmentList token={token} userRole={userRole} hasPerm={hasPerm} />}
       {activeTab === 'additional' && <MaterialRequestList token={token} userRole={userRole} requestType="ADDITIONAL" />}
       {activeTab === 'replacement' && <MaterialRequestList token={token} userRole={userRole} requestType="REPLACEMENT" />}
     </div>
@@ -52,7 +52,7 @@ export default function VendorShipmentModule({ token, userRole, hasPerm = () => 
 }
 
 // ─── SHIPMENT LIST ─────────────────────────────────────────────────────────────
-function ShipmentList({ token, userRole }) {
+function ShipmentList({ token, userRole, hasPerm = () => false }) {
   const [shipments, setShipments] = useState([]);
   const [vendors, setVendors] = useState([]);
   const [pos, setPOs] = useState([]);
@@ -71,9 +71,9 @@ function ShipmentList({ token, userRole }) {
   });
 
   const isSuperAdmin = userRole === 'superadmin';
-  const canCreate = ['superadmin', 'admin'].includes(userRole) || hasPerm('shipment.create');
-  const canDelete = ['superadmin', 'admin'].includes(userRole) || hasPerm('shipment.create');
-  const canEdit = ['superadmin', 'admin'].includes(userRole) || hasPerm('shipment.create');
+  const canCreate = ['superadmin', 'admin'].includes(userRole) || hasPerm('vendor_shipment.create') || hasPerm('shipment.create');
+  const canDelete = ['superadmin', 'admin'].includes(userRole) || hasPerm('vendor_shipment.delete') || hasPerm('shipment.delete');
+  const canEdit = ['superadmin', 'admin'].includes(userRole) || hasPerm('vendor_shipment.update') || hasPerm('shipment.update');
 
   useEffect(() => { fetchAll(); }, []);
 
