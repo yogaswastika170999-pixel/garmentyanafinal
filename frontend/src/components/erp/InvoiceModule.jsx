@@ -40,13 +40,19 @@ export default function InvoiceModule({ token, userRole, onNavigate }) {
 
   const handleEditSubmit = async (e) => {
     e.preventDefault();
-    await fetch(`/api/invoices/${editForm.id}`, {
+    const res = await fetch(`/api/invoices/${editForm.id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify(editForm)
     });
-    setShowEdit(false);
-    fetchInvoices();
+    if (res.ok) {
+      alert('✅ Invoice berhasil diupdate');
+      setShowEdit(false);
+      fetchInvoices();
+    } else {
+      const err = await res.json();
+      alert(`❌ Gagal update invoice: ${err.detail || 'Unknown error'}`);
+    }
   };
 
   const handleDelete = async () => {

@@ -41,6 +41,7 @@ export default function ManualInvoiceModule({ token, userRole }) {
   });
   const [poItems, setPoItems] = useState([]);
   const [invoiceItems, setInvoiceItems] = useState([]);
+  const [variances, setVariances] = useState([]); // NEW: variance data for selected PO
 
   // Revise form
   const [reviseForm, setReviseForm] = useState({ change_reason: '', invoice_items: [] });
@@ -75,7 +76,7 @@ export default function ManualInvoiceModule({ token, userRole }) {
   };
 
   const loadPOItems = async (poId) => {
-    if (!poId) { setPoItems([]); setInvoiceItems([]); return; }
+    if (!poId) { setPoItems([]); setInvoiceItems([]); setVariances([]); return; }
     setCreateForm(f => ({ ...f, source_po_id: poId }));
     const res = await fetch(`/api/po-items?po_id=${poId}`, { headers: { Authorization: `Bearer ${token}` } });
     const data = await res.json();
@@ -88,6 +89,12 @@ export default function ManualInvoiceModule({ token, userRole }) {
       cmt_price: it.cmt_price_snapshot || 0,
       po_item_id: it.id,
     })));
+    
+    // Fetch variances for this PO (Acknowledged or Resolved status)
+    const varRes = await fetch(`/api/production-variances?po_id=${poId}`, { headers: { Authorization: `Bearer ${token}` } });
+    const varData = await varRes.json();
+    const approvedVars = Array.isArray(varData) ? varData.filter(v => ['Acknowledged', 'Resolved'].includes(v.status)) : [];
+    setVariances(approvedVars);
   };
 
   const openCreate = async () => {

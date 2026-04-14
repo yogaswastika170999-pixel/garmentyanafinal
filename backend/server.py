@@ -1540,11 +1540,15 @@ async def create_invoice(request: Request):
 @api.put("/invoices/{inv_id}")
 async def update_invoice(inv_id: str, request: Request):
     user = await require_auth(request)
-    if not check_role(user, ['admin', 'finance']): raise HTTPException(403, 'Forbidden')
+    # Check permission: superadmin always allowed, or check invoice.update permission
+    if user.get('role') != 'superadmin':
+        if not (user.get('role') in ['admin', 'finance'] or 'invoice.update' in user.get('_permissions', [])):
+            raise HTTPException(403, 'Forbidden: Tidak memiliki permission untuk edit invoice')
     db = get_db()
     body = await request.json()
     body.pop('_id', None); body.pop('id', None)
     await db.invoices.update_one({'id': inv_id}, {'$set': {**body, 'updated_at': now()}})
+    await log_activity(user['id'], user['name'], 'Update', 'Invoice', f"Updated invoice {body.get('invoice_number', inv_id)}")
     return serialize_doc(await db.invoices.find_one({'id': inv_id}, {'_id': 0}))
 
 @api.delete("/invoices/{inv_id}")

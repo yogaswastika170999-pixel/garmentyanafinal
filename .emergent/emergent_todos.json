@@ -1,15 +1,11 @@
 [
   {
-    "content": "Fix Monitoring Produksi: kolom Dikirim - Vendor level sudah benar, job level perlu refactor (skip for now)",
+    "content": "Fix Invoice: bug revisi invoice tidak bisa - Added error handling & RBAC support",
     "status": "completed"
   },
   {
-    "content": "Fix Invoice: bug revisi invoice tidak bisa",
-    "status": "in_progress"
-  },
-  {
     "content": "Feature: Variance table di Invoice Buyer & Vendor",
-    "status": "pending"
+    "status": "in_progress"
   },
   {
     "content": "Feature: Invoice Edit Approval System (backend + frontend)",
