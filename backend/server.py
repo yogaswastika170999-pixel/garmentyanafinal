@@ -1770,17 +1770,18 @@ async def approve_invoice_edit_request(req_id: str, request: Request):
         category = invoice.get('invoice_category')
         recalc_items = []
         for it in items:
-            price = it.get('cmt_price', 0) if category == 'VENDOR' else it.get('selling_price', 0)
-            qty = it.get('invoice_qty', it.get('qty', 0))
-            recalc_items.append({**it, 'invoice_qty': qty, 'subtotal': qty * price})
+            price = float(it.get('cmt_price', 0) or 0) if category == 'VENDOR' else float(it.get('selling_price', 0) or 0)
+            qty = float(it.get('invoice_qty', it.get('qty', 0)) or 0)
+            subtotal = qty * price
+            recalc_items.append({**it, 'invoice_qty': qty, 'subtotal': subtotal})
         total_amount = sum(i['subtotal'] for i in recalc_items) - float(changes.get('discount', invoice.get('discount', 0)) or 0)
         update_payload['invoice_items'] = recalc_items
         update_payload['total_amount'] = total_amount
-        update_payload['remaining_balance'] = total_amount - (invoice.get('total_paid', 0))
+        update_payload['remaining_balance'] = total_amount - float(invoice.get('total_paid', 0) or 0)
         # Update status based on payment
-        if invoice.get('total_paid', 0) >= total_amount:
+        if float(invoice.get('total_paid', 0) or 0) >= total_amount:
             update_payload['status'] = 'Paid'
-        elif invoice.get('total_paid', 0) > 0:
+        elif float(invoice.get('total_paid', 0) or 0) > 0:
             update_payload['status'] = 'Partial'
         else:
             update_payload['status'] = 'Unpaid'
